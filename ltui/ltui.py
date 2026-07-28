@@ -12,10 +12,15 @@ from __future__ import annotations
 
 __version__ = "0.15.0"
 
+import asyncio
 import json
+import os
+import re
+import secrets
 import sys
 import tomllib
 import webbrowser
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,7 +36,7 @@ from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.widgets import Button, Footer, Input, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
-from textual.worker import WorkerState
+from textual.worker import WorkerCancelled, WorkerState
 
 API_URL = "https://api.linear.app/graphql"
 CONFIG = Path.home() / ".config/linear-cli/config.toml"
@@ -40,6 +45,37 @@ LTUI_JSON_CONFIG = Path.home() / ".config/ltui/config.json"
 STATE_FILE = Path.home() / ".local/state/ltui/state.json"
 CACHE_DIR = Path.home() / ".cache/ltui"
 AUTO_REFRESH_SECONDS = 180
+ALL_WORKSPACES = "__all__"
+
+
+@dataclass(frozen=True)
+class StoragePaths:
+    """Filesystem roots used by ltui, injectable so tests stay isolated."""
+
+    config: Path
+    linear_config: Path
+    state_root: Path
+    cache_root: Path
+
+    @property
+    def legacy_state(self) -> Path:
+        return self.state_root / "state.json"
+
+    @property
+    def global_state(self) -> Path:
+        return self.state_root / "global.json"
+
+    @property
+    def workspace_states(self) -> Path:
+        return self.state_root / "workspaces"
+
+
+DEFAULT_STORAGE = StoragePaths(
+    config=LTUI_CONFIG,
+    linear_config=CONFIG,
+    state_root=STATE_FILE.parent,
+    cache_root=CACHE_DIR,
+)
 
 # ── palette (catppuccin mocha) ────────────────────────────────────────────
 C_TEXT = "#cdd6f4"
@@ -342,6 +378,7 @@ DEFAULT_KEYBINDS = {
     "pick_project": (["V"], None),
     "cycle_theme": (["t"], "theme"),
     "open_settings": (["comma"], None),
+    "switch_workspace": (["w"], None),
     "help": (["question_mark"], "help"),
     "quit": (["q"], "quit"),
     "refresh": (["r"], None),
@@ -400,6 +437,7 @@ CONFIG_TEMPLATE = """{
     "pick_project": "V",
     "cycle_theme": "t",
     "open_settings": "comma",
+    "switch_workspace": "w",
     "help": "question_mark",
     "quit": "q",
     "refresh": "r",
@@ -423,24 +461,184 @@ CONFIG_TEMPLATE = """{
 """
 
 
-def load_api_key() -> str:
-    import os
+PROFILE_COMPONENT = re.compile(r"^[A-Za-z0-9_-]+$")
 
-    if key := os.environ.get("LINEAR_API_KEY"):
-        return key
+
+class CredentialsNotFound(RuntimeError):
+    """No usable Linear credentials were found in any supported source."""
+
+
+class ProfileConfigError(ValueError):
+    """The workspace profile configuration is present but invalid."""
+
+
+@dataclass(frozen=True)
+class WorkspaceProfile:
+    name: str
+    label: str
+    api_key: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ProfileResolution:
+    profiles: tuple[WorkspaceProfile, ...]
+    active: str
+    source: str
+    allow_legacy_storage: bool = False
+
+    def profile(self, name: str) -> WorkspaceProfile:
+        for profile in self.profiles:
+            if profile.name == name:
+                return profile
+        raise KeyError(name)
+
+
+@dataclass(frozen=True)
+class WorkspaceSnapshot:
+    profile: str
+    label: str
+    boot: dict
+    team: dict
+    issues: list[dict]
+    states: list[dict]
+
+
+def _validate_component(value: str, kind: str) -> str:
+    if not isinstance(value, str) or not PROFILE_COMPONENT.fullmatch(value):
+        raise ValueError(
+            f"invalid {kind}; use only letters, numbers, underscores, and hyphens"
+        )
+    return value
+
+
+def scoped_id(profile: str, remote_id: str) -> str:
+    """Encode a profile + remote id as an unambiguous Textual option id."""
+    return f"{len(profile)}:{profile}{remote_id}"
+
+
+def parse_workspace_profiles(
+    data: dict, saved_active: str | None = None
+) -> ProfileResolution:
+    """Parse the explicit ``[workspaces.*]`` configuration format."""
+    raw_profiles = data.get("workspaces")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        raise ProfileConfigError("workspaces must be a non-empty table")
+    profiles: list[WorkspaceProfile] = []
+    for raw_name, raw_profile in raw_profiles.items():
+        try:
+            name = _validate_component(raw_name, "workspace name")
+        except ValueError as error:
+            raise ProfileConfigError(str(error)) from None
+        if name == ALL_WORKSPACES:
+            raise ProfileConfigError(f"workspace name {ALL_WORKSPACES!r} is reserved")
+        if not isinstance(raw_profile, dict):
+            raise ProfileConfigError(f"workspace {name!r} must be a table")
+        api_key = raw_profile.get("api_key")
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ProfileConfigError(f"workspace {name!r} needs a non-empty api_key")
+        label = raw_profile.get("label", name)
+        if not isinstance(label, str) or not label.strip():
+            raise ProfileConfigError(f"workspace {name!r} has an invalid label")
+        profiles.append(WorkspaceProfile(name, label.strip(), api_key.strip()))
+
+    names = {profile.name for profile in profiles}
+    configured_default = data.get("default_workspace")
+    if configured_default is not None:
+        if not isinstance(configured_default, str) or configured_default not in names:
+            raise ProfileConfigError("default_workspace does not name a workspace")
+    saved_is_valid = isinstance(saved_active, str) and (
+        saved_active in names
+        or (saved_active == ALL_WORKSPACES and len(profiles) > 1)
+    )
+    active = saved_active if saved_is_valid else configured_default or profiles[0].name
+    return ProfileResolution(tuple(profiles), active, "multi")
+
+
+def _warn_if_config_is_public(path: Path) -> None:
+    if os.name == "nt":
+        return
     try:
-        if key := tomllib.loads(LTUI_CONFIG.read_text()).get("api_key"):
-            return key
-    except Exception:
+        if path.stat().st_mode & 0o077:
+            print(
+                f"ltui: {path} contains API keys; run: chmod 600 {path}",
+                file=sys.stderr,
+            )
+    except OSError:
         pass
-    cfg = tomllib.loads(CONFIG.read_text())
-    return cfg["workspaces"][cfg.get("current", "default")]["api_key"]
 
 
-def save_api_key(key: str) -> None:
-    LTUI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    LTUI_CONFIG.write_text(f'api_key = "{key}"\n')
-    LTUI_CONFIG.chmod(0o600)
+def resolve_workspace_profiles(
+    storage: StoragePaths = DEFAULT_STORAGE,
+    environ: dict[str, str] | os._Environ[str] | None = None,
+) -> ProfileResolution:
+    """Resolve workspace credentials without masking invalid configuration."""
+    environment = os.environ if environ is None else environ
+    if key := environment.get("LINEAR_API_KEY"):
+        return ProfileResolution(
+            (WorkspaceProfile("environment", "Environment", key),),
+            "environment",
+            "environment",
+        )
+
+    if storage.config.exists():
+        try:
+            config_data = tomllib.loads(storage.config.read_text())
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise ProfileConfigError(f"invalid ltui config: {error}") from None
+        if config_data:
+            _warn_if_config_is_public(storage.config)
+        if "workspaces" in config_data:
+            saved = load_global_state(storage).get("active_workspace")
+            return parse_workspace_profiles(config_data, saved)
+        key = config_data.get("api_key")
+        if key is not None:
+            if not isinstance(key, str) or not key.strip():
+                raise ProfileConfigError("api_key must be a non-empty string")
+            profile = WorkspaceProfile("default", "Default", key.strip())
+            return ProfileResolution((profile,), "default", "legacy", True)
+        if config_data:
+            raise ProfileConfigError(
+                "config must define api_key or one or more workspaces"
+            )
+
+    try:
+        linear_data = tomllib.loads(storage.linear_config.read_text())
+        workspace_name = linear_data.get("current", "default")
+        raw_workspace = linear_data["workspaces"][workspace_name]
+        key = raw_workspace["api_key"]
+        if not isinstance(key, str) or not key.strip():
+            raise KeyError("api_key")
+        safe_name = (
+            workspace_name
+            if isinstance(workspace_name, str)
+            and PROFILE_COMPONENT.fullmatch(workspace_name)
+            and workspace_name != ALL_WORKSPACES
+            else "linear-cli"
+        )
+        profile = WorkspaceProfile(safe_name, str(workspace_name), key.strip())
+        return ProfileResolution((profile,), safe_name, "linear-cli")
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
+        raise CredentialsNotFound("no Linear API key found") from None
+
+
+def load_api_key(storage: StoragePaths = DEFAULT_STORAGE) -> str:
+    """Backward-compatible single-key accessor."""
+    resolved = resolve_workspace_profiles(storage)
+    active = (
+        resolved.profiles[0].name
+        if resolved.active == ALL_WORKSPACES
+        else resolved.active
+    )
+    return resolved.profile(active).api_key
+
+
+def save_api_key(key: str, storage: StoragePaths = DEFAULT_STORAGE) -> None:
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("API key cannot be empty")
+    if "\n" in key or "\r" in key:
+        raise ValueError("API key cannot contain a line break")
+    escaped = key.strip().replace("\\", "\\\\").replace('"', '\\"')
+    _atomic_write_text(storage.config, storage.config.parent, f'api_key = "{escaped}"\n')
 
 
 async def verify_key(key: str) -> str:
@@ -543,44 +741,215 @@ def issue_sort_key(i: dict):
     return (-parse_dt(i["updatedAt"]).timestamp(),)
 
 
-def load_state() -> dict:
+def _path_within(path: Path, root: Path) -> bool:
+    path_abs = Path(os.path.abspath(path))
+    root_abs = Path(os.path.abspath(root))
+    return path_abs == root_abs or root_abs in path_abs.parents
+
+
+def _check_no_symlinks(root: Path, path: Path) -> None:
+    if not _path_within(path, root):
+        raise ValueError("storage path escapes its configured root")
+    root_abs = Path(os.path.abspath(root))
+    path_abs = Path(os.path.abspath(path))
+    current = root_abs
+    candidates = [current]
+    for component in path_abs.relative_to(root_abs).parts:
+        current = current / component
+        candidates.append(current)
+    for candidate in candidates:
+        try:
+            if stat_is_symlink(candidate):
+                raise OSError(f"refusing symlink in storage path: {candidate}")
+        except FileNotFoundError:
+            continue
+
+
+def stat_is_symlink(path: Path) -> bool:
+    return bool(path.lstat().st_mode & 0o170000 == 0o120000)
+
+
+def _ensure_private_dir(root: Path, path: Path) -> None:
+    _check_no_symlinks(root, path)
+    root_abs = Path(os.path.abspath(root))
+    path_abs = Path(os.path.abspath(path))
+    relative_parts = path_abs.relative_to(root_abs).parts
+    directories = [root_abs]
+    directories.extend(
+        root_abs.joinpath(*relative_parts[:index])
+        for index in range(1, len(relative_parts) + 1)
+    )
+    for directory in directories:
+        if directory.exists():
+            if stat_is_symlink(directory) or not directory.is_dir():
+                raise OSError(f"unsafe storage directory: {directory}")
+        else:
+            directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+        if os.name != "nt":
+            directory.chmod(0o700)
+
+
+def _atomic_write_text(path: Path, root: Path, text: str) -> None:
+    if not _path_within(path, root):
+        raise ValueError("storage path escapes its configured root")
+    _ensure_private_dir(root, path.parent)
+    _check_no_symlinks(root, path)
+    if path.exists() and stat_is_symlink(path):
+        raise OSError(f"refusing symlink target: {path}")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    temp = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
     try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {}
+        descriptor = os.open(temp, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.exists() and stat_is_symlink(path):
+            raise OSError(f"refusing symlink target: {path}")
+        os.replace(temp, path)
+        if os.name != "nt":
+            path.chmod(0o600)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
-def save_state(data: dict) -> None:
+def _read_json(path: Path, root: Path) -> dict | None:
+    _check_no_symlinks(root, path)
     try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(data))
-    except Exception:
-        pass
-
-
-def read_cache(name: str) -> dict | None:
-    try:
-        return json.loads((CACHE_DIR / f"{name}.json").read_text())
-    except Exception:
+        raw = path.read_text()
+    except FileNotFoundError:
         return None
-
-
-def write_cache(name: str, data: dict) -> None:
     try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (CACHE_DIR / f"{name}.json").write_text(json.dumps(data))
-    except Exception:
-        pass
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
-def clear_cache() -> int:
+def _write_json(path: Path, root: Path, data: dict) -> None:
+    _atomic_write_text(path, root, json.dumps(data, separators=(",", ":")))
+
+
+def profile_state_path(storage: StoragePaths, profile: str) -> Path:
+    _validate_component(profile, "workspace name")
+    path = storage.workspace_states / f"{profile}.json"
+    if not _path_within(path, storage.state_root):
+        raise ValueError("workspace state path escapes its configured root")
+    return path
+
+
+def profile_cache_path(storage: StoragePaths, profile: str, name: str) -> Path:
+    _validate_component(profile, "workspace name")
+    _validate_component(name, "cache name")
+    path = storage.cache_root / profile / f"{name}.json"
+    if not _path_within(path, storage.cache_root):
+        raise ValueError("workspace cache path escapes its configured root")
+    return path
+
+
+def load_global_state(storage: StoragePaths = DEFAULT_STORAGE) -> dict:
+    return _read_json(storage.global_state, storage.state_root) or {}
+
+
+def save_global_state(storage: StoragePaths, data: dict) -> None:
+    _write_json(storage.global_state, storage.state_root, data)
+
+
+def load_state(
+    storage: StoragePaths = DEFAULT_STORAGE,
+    profile: str = "default",
+    allow_legacy: bool = False,
+) -> dict:
+    data = _read_json(profile_state_path(storage, profile), storage.state_root)
+    if data is None and allow_legacy:
+        data = _read_json(storage.legacy_state, storage.state_root)
+    return data or {}
+
+
+def save_state(
+    storage: StoragePaths | dict,
+    profile: str = "default",
+    data: dict | None = None,
+) -> None:
+    # Keep the old ``save_state(data)`` call shape available to external users.
+    if isinstance(storage, dict):
+        data = storage
+        storage = DEFAULT_STORAGE
+    if data is None:
+        raise TypeError("state data is required")
+    _write_json(profile_state_path(storage, profile), storage.state_root, data)
+
+
+def read_cache(
+    storage: StoragePaths | str = DEFAULT_STORAGE,
+    profile: str = "default",
+    name: str | None = None,
+    allow_legacy: bool = False,
+) -> dict | None:
+    # Keep the old ``read_cache(name)`` shape while the app migrates below.
+    if isinstance(storage, str):
+        name = storage
+        storage = DEFAULT_STORAGE
+    if name is None:
+        raise TypeError("cache name is required")
+    data = _read_json(profile_cache_path(storage, profile, name), storage.cache_root)
+    if data is None and allow_legacy:
+        _validate_component(name, "cache name")
+        data = _read_json(storage.cache_root / f"{name}.json", storage.cache_root)
+    return data
+
+
+def write_cache(
+    storage: StoragePaths | str,
+    profile: str | dict,
+    name: str | None = None,
+    data: dict | None = None,
+) -> None:
+    # Keep the old ``write_cache(name, data)`` shape while the app migrates below.
+    if isinstance(storage, str) and isinstance(profile, dict):
+        name, data, storage, profile = storage, profile, DEFAULT_STORAGE, "default"
+    if not isinstance(storage, StoragePaths) or not isinstance(profile, str):
+        raise TypeError("invalid cache arguments")
+    if name is None or data is None:
+        raise TypeError("cache name and data are required")
+    _write_json(profile_cache_path(storage, profile, name), storage.cache_root, data)
+
+
+def clear_cache(
+    storage: StoragePaths = DEFAULT_STORAGE,
+    profile: str = "default",
+    allow_legacy: bool = False,
+) -> int:
+    _validate_component(profile, "workspace name")
+    directory = storage.cache_root / profile
+    _check_no_symlinks(storage.cache_root, directory)
     count = 0
-    try:
-        for f in CACHE_DIR.glob("*.json"):
-            f.unlink()
+    if directory.exists():
+        for path in directory.iterdir():
+            if path.suffix != ".json":
+                continue
+            if stat_is_symlink(path):
+                raise OSError(f"refusing symlink cache entry: {path}")
+            path.unlink()
             count += 1
-    except Exception:
-        pass
+    if allow_legacy and storage.cache_root.exists():
+        _check_no_symlinks(storage.cache_root, storage.cache_root)
+        for path in storage.cache_root.iterdir():
+            if path.suffix != ".json":
+                continue
+            if stat_is_symlink(path):
+                raise OSError(f"refusing symlink cache entry: {path}")
+            if not path.is_file():
+                continue
+            path.unlink()
+            count += 1
     return count
 
 
@@ -1099,7 +1468,13 @@ class SettingsModal(ModalScreen):
         self.query_one("#settings-profile", Static).update(profile)
         foot = Text()
         foot.append(f"ltui {__version__}", style=C_DIM)
-        foot.append("  ·  cache ~/.cache/ltui", style=C_VFAINT)
+        workspace = getattr(app, "_active_profile", None) or "default"
+        cache_hint = (
+            "all workspace caches"
+            if workspace == ALL_WORKSPACES
+            else f"cache ~/.cache/ltui/{workspace}"
+        )
+        foot.append(f"  ·  {cache_hint}", style=C_VFAINT)
         self.query_one("#settings-foot", Static).update(foot)
         self._build()
         self.query_one("#settings-list").focus()
@@ -1112,6 +1487,18 @@ class SettingsModal(ModalScreen):
         opts: list[Option] = [
             Option(Text(" preferences", style=f"bold {C_SUB}"), disabled=True)
         ]
+        workspace = getattr(app, "_active_profile", None)
+        resolution = getattr(app, "_profile_resolution", None)
+        if workspace and resolution is not None:
+            label = (
+                "All workspaces"
+                if workspace == ALL_WORKSPACES
+                else resolution.profile(workspace).label
+            )
+            row = Text("   ")
+            row.append("◆ ", style=C_BLUE)
+            row.append(f"workspace  {label}", style=C_TEXT)
+            opts.append(Option(row, id="workspace:switch"))
         mine = getattr(app, "_mine", False)
         row = Text("   ")
         row.append("● " if mine else "○ ", style=C_GREEN if mine else C_DIM)
@@ -1119,7 +1506,8 @@ class SettingsModal(ModalScreen):
         opts.append(Option(row, id="pref:mine"))
         opts.append(Option(Text(" "), disabled=True))
         opts.append(Option(Text(" maintenance", style=f"bold {C_SUB}"), disabled=True))
-        opts.append(Option(Text("    clear cache", style=C_SUB), id="cache:clear"))
+        cache_label = "clear all caches" if workspace == ALL_WORKSPACES else "clear cache"
+        opts.append(Option(Text(f"    {cache_label}", style=C_SUB), id="cache:clear"))
         ol.add_options(opts)
         ol.highlighted = prev if prev is not None else 1
 
@@ -1127,10 +1515,14 @@ class SettingsModal(ModalScreen):
     def _selected(self, event: OptionList.OptionSelected) -> None:
         app = self.app
         oid = event.option.id or ""
-        if oid == "pref:mine":
+        if oid == "workspace:switch":
+            self.dismiss(None)
+            app.call_later(app.action_switch_workspace)
+            return
+        elif oid == "pref:mine":
             app.action_toggle_mine()
         elif oid == "cache:clear":
-            count = clear_cache()
+            count = app._clear_active_cache()
             app.notify(f" cleared {count} cached file(s)")
         self._build()
 
@@ -1160,7 +1552,7 @@ class HelpModal(ModalScreen):
             ("esc", "close panel · dismiss modal · clear filter"),
         ]),
         ("ticket", [
-            ("n", "new ticket in the current team"),
+            ("n", "new ticket (choose workspace in All)"),
             ("s", "change status"),
             ("p", "change priority"),
             ("l", "edit labels"),
@@ -1172,8 +1564,9 @@ class HelpModal(ModalScreen):
         ]),
         ("view", [
             ("/", "filter issues"),
+            ("w", "switch workspace / All view"),
             ("m", "toggle mine only"),
-            ("v", "group by status / project"),
+            ("v", "group by workspace / status / project"),
             ("V", "filter to a single project"),
             ("t", "cycle theme"),
             (",", "settings"),
@@ -1458,8 +1851,20 @@ class LTUI(App):
     #welcome-actions Button {{ margin: 0 0 0 2; min-width: 10; }}
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        profile_resolution: ProfileResolution | None = None,
+        storage: StoragePaths = DEFAULT_STORAGE,
+        client_factory=None,
+    ) -> None:
         super().__init__()
+        self._storage = storage
+        self._profile_resolution = profile_resolution
+        self._active_profile: str | None = (
+            profile_resolution.active if profile_resolution is not None else None
+        )
+        self._client_factory = client_factory
+        self._switching = False
         self.client: httpx.AsyncClient | None = None
         self._teams: list[dict] = []
         self._issues: list[dict] = []
@@ -1467,13 +1872,18 @@ class LTUI(App):
         self._members: dict[str, list] = {}
         self._team_labels: dict[str, list] = {}
         self._team_projects: dict[str, list] = {}
+        self._workspace_states: dict[str, list[dict]] = {}
+        self._workspace_viewers: dict[str, dict] = {}
+        self._workspace_teams: dict[str, dict] = {}
+        self._workspace_snapshots: dict[str, WorkspaceSnapshot] = {}
+        self._aggregate_generation = 0
         self._team: dict | None = None
         self._viewer_id: str | None = None
         self._viewer_name: str | None = None
         self._boot_data: dict | None = None
         self._org: str | None = None
-        self._mine = load_state().get("mine", False)
-        self._group_by = load_state().get("group_by", "status")
+        self._mine = False
+        self._group_by = "status"
         self._filter = ""
         self._project_filter: str | None = None  # project id, "" = no-project
         self._detail_issue: dict | None = None
@@ -1483,6 +1893,109 @@ class LTUI(App):
         self._spin_frame = 0
         self._opt_index: dict[str, int] = {}
         self._issue_by_id: dict[str, dict] = {}
+        self._header_indices: list[int] = []
+        self._group_starts: list[int] = []
+
+    @property
+    def active_workspace(self) -> str:
+        if self._active_profile is None:
+            raise RuntimeError("no active workspace")
+        return self._active_profile
+
+    def _profile(self, name: str | None = None) -> WorkspaceProfile:
+        if self._profile_resolution is None:
+            raise RuntimeError("workspace profiles have not been loaded")
+        return self._profile_resolution.profile(name or self.active_workspace)
+
+    @property
+    def _is_all_workspaces(self) -> bool:
+        return self._active_profile == ALL_WORKSPACES
+
+    def _issue_workspace(self, issue: dict) -> str:
+        return issue.get("_workspace") or self.active_workspace
+
+    def _team_workspace(self, team: dict) -> str:
+        return team.get("_workspace") or self.active_workspace
+
+    def _issue_key(self, issue: dict) -> str:
+        workspace = issue.get("_workspace")
+        return scoped_id(workspace, issue["id"]) if workspace else issue["id"]
+
+    def _team_key(self, team: dict) -> str:
+        workspace = team.get("_workspace")
+        return scoped_id(workspace, team["id"]) if workspace else team["id"]
+
+    def _team_for_issue(self, issue: dict) -> dict | None:
+        workspace = self._issue_workspace(issue)
+        if self._is_all_workspaces:
+            return self._workspace_teams.get(workspace)
+        return self._team
+
+    def _states_for_issue(self, issue: dict) -> list[dict]:
+        if self._is_all_workspaces:
+            return self._workspace_states.get(self._issue_workspace(issue), [])
+        return self._states
+
+    def _load_profile_state(self) -> dict:
+        if self._active_profile is None:
+            return {}
+        allow_legacy = bool(
+            self._profile_resolution
+            and self._profile_resolution.allow_legacy_storage
+        )
+        return load_state(
+            self._storage, self.active_workspace, allow_legacy=allow_legacy
+        )
+
+    def _clear_active_cache(self) -> int:
+        if self._is_all_workspaces:
+            return sum(
+                clear_cache(self._storage, profile.name)
+                for profile in self._profile_resolution.profiles
+            )
+        allow_legacy = bool(
+            self._profile_resolution
+            and self._profile_resolution.allow_legacy_storage
+        )
+        return clear_cache(
+            self._storage,
+            self.active_workspace,
+            allow_legacy=allow_legacy,
+        )
+
+    def _apply_profile_preferences(self) -> None:
+        state = self._load_profile_state()
+        self._mine = bool(state.get("mine", False))
+        group_by = state.get("group_by", "status")
+        allowed_groups = (
+            ("workspace", "status", "project")
+            if self._is_all_workspaces
+            else ("status", "project")
+        )
+        self._group_by = group_by if group_by in allowed_groups else allowed_groups[0]
+        self._filter = ""
+        self._project_filter = None
+        saved_theme = state.get("theme")
+        self.theme = (
+            saved_theme if saved_theme in self.available_themes else THEME_NAMES[0]
+        )
+        sidebar = self.query_one("#sidebar")
+        detail = self.query_one("#detail")
+        sidebar.styles.width = int(state["sidebar_w"]) if state.get("sidebar_w") else None
+        detail.styles.width = int(state["detail_w"]) if state.get("detail_w") else None
+
+    def _make_client(self, key: str):
+        return httpx.AsyncClient(
+            headers={"Authorization": key, "Content-Type": "application/json"},
+            timeout=20,
+        )
+
+    def _new_client(self, key: str):
+        return (
+            self._client_factory(key)
+            if self._client_factory is not None
+            else self._make_client(key)
+        )
 
     def _on_theme_changed(self, _theme) -> None:
         # ansi-background themes (clear, ansi-dark, …) need ansi_color mode
@@ -1554,76 +2067,322 @@ class LTUI(App):
         for t in THEMES:
             self.register_theme(t)
         self.theme_changed_signal.subscribe(self, self._on_theme_changed)
-        saved = load_state().get("theme")
-        self.theme = saved if saved in self.available_themes else THEME_NAMES[0]
-        self.ansi_color = self._theme_is_ansi()
-        layout = load_state()
-        if w := layout.get("sidebar_w"):
-            self.query_one("#sidebar").styles.width = int(w)
-        if w := layout.get("detail_w"):
-            self.query_one("#detail").styles.width = int(w)
         self.query_one("#teams").border_title = " teams "
         self.query_one("#profile").border_title = " you "
         self.query_one("#centre").border_title = " issues "
-        self._update_profile()
         self.set_interval(FX_TICK, self._tick_fx)
+        refresh_s = CONFIG_OPTIONS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS)
+        if isinstance(refresh_s, (int, float)) and refresh_s > 0:
+            self.set_interval(refresh_s, self._auto_refresh_board)
         self.query_one("#issues").focus()
         try:
-            key = load_api_key()
-        except Exception:
+            if self._profile_resolution is None:
+                self._profile_resolution = resolve_workspace_profiles(self._storage)
+                self._active_profile = self._profile_resolution.active
+        except CredentialsNotFound:
             def connected(new_key: str | None) -> None:
                 if not new_key:
                     return
                 try:
-                    save_api_key(new_key)
+                    save_api_key(new_key, self._storage)
+                    self._profile_resolution = resolve_workspace_profiles(
+                        self._storage
+                    )
+                    self._active_profile = self._profile_resolution.active
+                    self._apply_profile_preferences()
                 except Exception as e:
                     self.notify(f"couldn't save key: {e}", severity="error")
-                self._start(new_key)
+                    return
+                self._update_profile()
+                self._start(self._profile().api_key)
 
             self.push_screen(OnboardModal(), connected)
             return
-        self._start(key)
+        except ProfileConfigError as error:
+            self.theme = THEME_NAMES[0]
+            self.ansi_color = self._theme_is_ansi()
+            self._update_profile()
+            self.notify(f"configuration error: {error}", severity="error", timeout=12)
+            return
+        self._apply_profile_preferences()
+        self.ansi_color = self._theme_is_ansi()
+        self._update_profile()
+        if self._is_all_workspaces:
+            self._start_all_workspaces()
+        else:
+            self._start(self._profile().api_key)
 
     def _start(self, key: str) -> None:
-        self.client = httpx.AsyncClient(
-            headers={"Authorization": key, "Content-Type": "application/json"},
-            timeout=20,
-        )
+        self.client = self._new_client(key)
         # render instantly from cache, then refresh live data concurrently
         team = None
-        if boot_cache := read_cache("boot"):
+        allow_legacy = bool(
+            self._profile_resolution
+            and self._profile_resolution.allow_legacy_storage
+        )
+        if boot_cache := read_cache(
+            self._storage,
+            self.active_workspace,
+            "boot",
+            allow_legacy=allow_legacy,
+        ):
             self._render_boot(boot_cache)
-            last_id = load_state().get("team_id")
+            last_id = self._load_profile_state().get("team_id")
             team = next((t for t in self._teams if t["id"] == last_id), None)
         if team is not None:
             self.query_one("#teams", NavList).highlighted = self._teams.index(team)
             self.load_team(team)
         self.boot(pick_team=team is None)
-        refresh_s = CONFIG_OPTIONS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS)
-        if isinstance(refresh_s, (int, float)) and refresh_s > 0:
-            self.set_interval(refresh_s, self._auto_refresh_board)
         # one-time tour; _start may run inside OnboardModal's dismiss callback
         # (screen still popping), so defer the push a tick
-        if not load_state().get("welcomed"):
+        if not self._load_profile_state().get("welcomed"):
+            self.call_later(self._show_welcome)
+
+    def _start_all_workspaces(self) -> None:
+        self.client = None
+        self._aggregate_generation += 1
+        generation = self._aggregate_generation
+        cached = {
+            profile.name: snapshot
+            for profile in self._profile_resolution.profiles
+            if (snapshot := self._cached_workspace_snapshot(profile)) is not None
+        }
+        if cached:
+            self._render_all_workspaces(cached)
+        else:
+            self.query_one("#issues", NavList).loading = True
+        self.load_all_workspaces(generation, cached)
+        if not self._load_profile_state().get("welcomed"):
             self.call_later(self._show_welcome)
 
     def _show_welcome(self) -> None:
         def done(_: object | None) -> None:
-            data = load_state()
+            data = self._load_profile_state()
             data["welcomed"] = True
-            save_state(data)
+            save_state(self._storage, self.active_workspace, data)
 
         self.push_screen(WelcomeModal(), done)
 
+    async def on_unmount(self) -> None:
+        if self.client is not None:
+            await self.client.aclose()
+            self.client = None
+
     # ── api ───────────────────────────────────────────────────────────
     async def gql(self, query: str, variables: dict | None = None) -> dict:
-        resp = await self.client.post(
+        if self._switching and query.lstrip().startswith("mutation"):
+            raise RuntimeError("workspace switch in progress")
+        if self.client is None:
+            raise RuntimeError("Linear client is not connected")
+        return await self._gql_client(self.client, query, variables)
+
+    async def _gql_client(
+        self, client, query: str, variables: dict | None = None
+    ) -> dict:
+        resp = await client.post(
             API_URL, json={"query": query, "variables": variables or {}}
         )
         data = resp.json()
         if data.get("errors"):
             raise RuntimeError(data["errors"][0].get("message", "GraphQL error"))
         return data["data"]
+
+    async def _cancel_aggregate_refresh_for_mutation(self) -> None:
+        self._aggregate_generation += 1
+        cancelled = self.workers.cancel_group(self, "boot")
+        for worker in cancelled:
+            try:
+                await worker.wait()
+            except WorkerCancelled:
+                pass
+
+    async def _gql_for_workspace(
+        self, profile_name: str, query: str, variables: dict | None = None
+    ) -> dict:
+        is_mutation = query.lstrip().startswith("mutation")
+        if self._switching and is_mutation:
+            raise RuntimeError("workspace switch in progress")
+        if self._is_all_workspaces and is_mutation:
+            await self._cancel_aggregate_refresh_for_mutation()
+        if not self._is_all_workspaces and profile_name == self.active_workspace:
+            return await self.gql(query, variables)
+        profile = self._profile(profile_name)
+        client = self._new_client(profile.api_key)
+        try:
+            return await self._gql_client(client, query, variables)
+        finally:
+            await client.aclose()
+
+    async def _gql_for_issue(
+        self, issue: dict, query: str, variables: dict | None = None
+    ) -> dict:
+        return await self._gql_for_workspace(
+            self._issue_workspace(issue), query, variables
+        )
+
+    async def _gql_for_team(
+        self, team: dict, query: str, variables: dict | None = None
+    ) -> dict:
+        return await self._gql_for_workspace(
+            self._team_workspace(team), query, variables
+        )
+
+    def _workspace_team(self, profile: str, boot: dict) -> dict | None:
+        teams = boot.get("teams", {}).get("nodes", [])
+        saved_team = load_state(self._storage, profile).get("team_id")
+        return next((team for team in teams if team["id"] == saved_team), None) or (
+            teams[0] if teams else None
+        )
+
+    def _cached_workspace_snapshot(
+        self, profile: WorkspaceProfile
+    ) -> WorkspaceSnapshot | None:
+        boot = read_cache(self._storage, profile.name, "boot")
+        if not boot:
+            return None
+        team = self._workspace_team(profile.name, boot)
+        if team is None:
+            return None
+        team_cache = read_cache(
+            self._storage, profile.name, f"team-{team['id']}"
+        )
+        if not team_cache:
+            return None
+        return WorkspaceSnapshot(
+            profile.name,
+            profile.label,
+            boot,
+            team,
+            team_cache.get("issues", []),
+            team_cache.get("states", []),
+        )
+
+    async def _fetch_workspace_snapshot(
+        self, profile: WorkspaceProfile, semaphore: asyncio.Semaphore
+    ) -> WorkspaceSnapshot:
+        async with semaphore:
+            client = self._new_client(profile.api_key)
+            try:
+                boot = await self._gql_client(client, QL_BOOT)
+                team = self._workspace_team(profile.name, boot)
+                if team is None:
+                    raise RuntimeError("no teams found")
+                data = await self._gql_client(
+                    client, QL_ISSUES, {"teamId": team["id"]}
+                )
+                return WorkspaceSnapshot(
+                    profile.name,
+                    profile.label,
+                    boot,
+                    team,
+                    data["team"]["issues"]["nodes"],
+                    data["team"]["states"]["nodes"],
+                )
+            finally:
+                await client.aclose()
+
+    def _aggregate_is_current(self, generation: int) -> bool:
+        return self._is_all_workspaces and generation == self._aggregate_generation
+
+    @work(exclusive=True, group="boot")
+    async def load_all_workspaces(
+        self, generation: int, cached: dict[str, WorkspaceSnapshot]
+    ) -> None:
+        semaphore = asyncio.Semaphore(4)
+        profiles = list(self._profile_resolution.profiles)
+        results = await asyncio.gather(
+            *(
+                self._fetch_workspace_snapshot(profile, semaphore)
+                for profile in profiles
+            ),
+            return_exceptions=True,
+        )
+        if not self._aggregate_is_current(generation):
+            return
+        merged = dict(cached)
+        for profile, result in zip(profiles, results):
+            if isinstance(result, BaseException):
+                self.notify(
+                    f"{profile.label}: {result}", severity="error", timeout=10
+                )
+                continue
+            if not self._aggregate_is_current(generation):
+                return
+            write_cache(self._storage, profile.name, "boot", result.boot)
+            if not self._aggregate_is_current(generation):
+                return
+            write_cache(
+                self._storage,
+                profile.name,
+                f"team-{result.team['id']}",
+                {"issues": result.issues, "states": result.states},
+            )
+            merged[profile.name] = result
+        if not self._aggregate_is_current(generation):
+            return
+        self._render_all_workspaces(merged)
+        self.query_one("#issues", NavList).loading = False
+
+    def _render_all_workspaces(
+        self, snapshots: dict[str, WorkspaceSnapshot]
+    ) -> None:
+        detail_key = (
+            self._issue_key(self._detail_issue)
+            if self._detail_issue is not None
+            else None
+        )
+        self._workspace_snapshots = snapshots
+        self._workspace_states = {
+            name: snapshot.states for name, snapshot in snapshots.items()
+        }
+        self._workspace_viewers = {
+            name: snapshot.boot["viewer"] for name, snapshot in snapshots.items()
+        }
+        self._workspace_teams = {}
+        self._teams = []
+        self._issues = []
+        self._states = []
+        for name, snapshot in snapshots.items():
+            team = dict(snapshot.team)
+            team["_workspace"] = name
+            self._workspace_teams[name] = team
+            self._teams.append(team)
+            self._states.extend(snapshot.states)
+            for raw_issue in snapshot.issues:
+                issue = dict(raw_issue)
+                issue["_workspace"] = name
+                self._issues.append(issue)
+        self._team = None
+        self._viewer_id = None
+        self._viewer_name = "All workspaces"
+        self._org = f"{len(snapshots)} connected"
+        self._issue_by_id = {self._issue_key(issue): issue for issue in self._issues}
+        if detail_key is not None:
+            fresh_detail = self._issue_by_id.get(detail_key)
+            if fresh_detail is None:
+                self.close_detail()
+            else:
+                self._detail_issue = fresh_detail
+                self.query_one("#d-title", Static).update(
+                    Text(fresh_detail["title"], style=f"bold {C_TEXT}")
+                )
+                self._update_detail_meta(fresh_detail)
+                description = fresh_detail.get("description") or "*no description*"
+                self.query_one("#d-desc", Markdown).update(description)
+        teams_list = self.query_one("#teams", NavList)
+        teams_list.clear_options()
+        for profile in self._profile_resolution.profiles:
+            snapshot = snapshots.get(profile.name)
+            count = len(snapshot.issues) if snapshot else 0
+            row = Text("◆ ", style=C_BLUE)
+            row.append(profile.label, style=C_TEXT)
+            row.append(f"  {count}", style=C_DIM)
+            teams_list.add_option(Option(row, id=f"workspace:{profile.name}"))
+        self.query_one("#teams").border_title = " workspaces "
+        self.query_one("#centre").border_title = " all workspaces "
+        self._update_profile()
+        self._update_header()
+        self.render_issues()
 
     # ── workers ───────────────────────────────────────────────────────
     def _render_boot(self, data: dict) -> None:
@@ -1663,11 +2422,13 @@ class LTUI(App):
                 issues_list.loading = False
             self.notify(f"linear: {e}", severity="error", timeout=10)
             return
+        if self._switching:
+            return
         self._render_boot(data)
-        write_cache("boot", data)
+        write_cache(self._storage, self.active_workspace, "boot", data)
         if not pick_team:
             return
-        last = load_state().get("team_id")
+        last = self._load_profile_state().get("team_id")
         team = next((t for t in self._teams if t["id"] == last), None) or (
             self._teams[0] if self._teams else None
         )
@@ -1679,7 +2440,9 @@ class LTUI(App):
         self.load_team(team)
 
     def _save_layout(self, reset: str | None = None) -> None:
-        data = load_state()
+        if self._active_profile is None:
+            return
+        data = self._load_profile_state()
         if reset == "#sidebar":
             data.pop("sidebar_w", None)
         else:
@@ -1689,20 +2452,55 @@ class LTUI(App):
             data.pop("detail_w", None)
         elif detail.has_class("open"):
             data["detail_w"] = detail.outer_size.width
-        save_state(data)
+        save_state(self._storage, self.active_workspace, data)
 
     def _save_state(self) -> None:
-        data = load_state()
+        if self._active_profile is None:
+            return
+        data = self._load_profile_state()
         if self._team is not None:
             data["team_id"] = self._team["id"]
         data["mine"] = self._mine
         data["theme"] = self.theme
         data["group_by"] = self._group_by
-        save_state(data)
+        save_state(self._storage, self.active_workspace, data)
 
-    def _write_team_cache(self) -> None:
-        if self._team is not None:
+    @staticmethod
+    def _without_internal_fields(data: dict) -> dict:
+        return {key: value for key, value in data.items() if not key.startswith("_")}
+
+    def _write_team_cache(self, issue: dict | None = None) -> None:
+        if self._is_all_workspaces and issue is not None:
+            workspace = self._issue_workspace(issue)
+            team = self._workspace_teams.get(workspace)
+            if team is None:
+                return
+            issues = [
+                self._without_internal_fields(candidate)
+                for candidate in self._issues
+                if self._issue_workspace(candidate) == workspace
+            ]
+            states = self._workspace_states.get(workspace, [])
             write_cache(
+                self._storage,
+                workspace,
+                f"team-{team['id']}",
+                {"issues": issues, "states": states},
+            )
+            snapshot = self._workspace_snapshots.get(workspace)
+            if snapshot is not None:
+                self._workspace_snapshots[workspace] = WorkspaceSnapshot(
+                    snapshot.profile,
+                    snapshot.label,
+                    snapshot.boot,
+                    snapshot.team,
+                    issues,
+                    states,
+                )
+        elif self._team is not None:
+            write_cache(
+                self._storage,
+                self.active_workspace,
                 f"team-{self._team['id']}",
                 {"issues": self._issues, "states": self._states},
             )
@@ -1710,7 +2508,7 @@ class LTUI(App):
     def _set_issues(self, issues: list[dict], states: list[dict]) -> None:
         self._issues = issues
         self._states = states
-        self._issue_by_id = {i["id"]: i for i in issues}
+        self._issue_by_id = {self._issue_key(issue): issue for issue in issues}
 
     @work(exclusive=True, group="issues")
     async def load_team(self, team: dict) -> None:
@@ -1719,7 +2517,16 @@ class LTUI(App):
         centre.border_title = f" {team['key']} · {team['name']} "
         centre.border_subtitle = ""
         issues_list = self.query_one("#issues", NavList)
-        cached = read_cache(f"team-{team['id']}")
+        allow_legacy = bool(
+            self._profile_resolution
+            and self._profile_resolution.allow_legacy_storage
+        )
+        cached = read_cache(
+            self._storage,
+            self.active_workspace,
+            f"team-{team['id']}",
+            allow_legacy=allow_legacy,
+        )
         if cached:
             self._set_issues(cached["issues"], cached["states"])
             self.render_issues()
@@ -1735,6 +2542,9 @@ class LTUI(App):
             self._refreshing = False
             self.notify(f"linear: {e}", severity="error", timeout=10)
             return
+        if self._switching:
+            self._refreshing = False
+            return
         if self._team is None or self._team["id"] != team["id"]:
             self._refreshing = False
             return  # user switched teams while refreshing
@@ -1744,6 +2554,8 @@ class LTUI(App):
         issues_list.loading = False
         self._refreshing = False
         write_cache(
+            self._storage,
+            self.active_workspace,
             f"team-{team['id']}",
             {"issues": self._issues, "states": self._states},
         )
@@ -1755,7 +2567,7 @@ class LTUI(App):
             if focused is None or focused.id == "teams":
                 issues_list.focus()
         if self._detail_issue is not None:
-            fresh = self._issue_by_id.get(self._detail_issue["id"])
+            fresh = self._issue_by_id.get(self._issue_key(self._detail_issue))
             if fresh is not None:
                 self._detail_issue = fresh
                 self._update_detail_meta(fresh)
@@ -1767,16 +2579,20 @@ class LTUI(App):
         # "issues" worker group makes this a quiet swap that preserves the
         # highlight and the open detail panel. Skip whenever it could
         # interrupt the user (modal open) or race a pending mutation.
-        if self.client is None or self._team is None:
+        if self._switching:
             return
         if isinstance(self.screen, ModalScreen):
             return
         if any(
-            w.group == "mutate" and w.state == WorkerState.RUNNING
+            w.group == "mutate"
+            and w.state in (WorkerState.PENDING, WorkerState.RUNNING)
             for w in self.workers
         ):
             return
-        self.load_team(self._team)
+        if self._is_all_workspaces:
+            self._start_all_workspaces()
+        elif self.client is not None and self._team is not None:
+            self.load_team(self._team)
 
     @work(exclusive=True, group="detail")
     async def load_comments(self, issue: dict) -> None:
@@ -1791,11 +2607,18 @@ class LTUI(App):
         await box.remove_children()
         head.update(Text(" comments · loading…", style=C_DIM))
         try:
-            data = await self.gql(QL_COMMENTS, {"id": issue["id"]})
+            data = await self._gql_for_issue(
+                issue, QL_COMMENTS, {"id": issue["id"]}
+            )
         except Exception as e:
             head.update(Text(f" comments · failed: {e}", style=C_RED))
             return
-        if self._detail_issue is None or self._detail_issue["id"] != issue["id"]:
+        if self._switching:
+            return
+        if (
+            self._detail_issue is None
+            or self._issue_key(self._detail_issue) != self._issue_key(issue)
+        ):
             return
         # parent + sub-issues context (old caches / demo stubs lack the keys)
         parent = data["issue"].get("parent")
@@ -1855,46 +2678,50 @@ class LTUI(App):
     @work(group="mutate")
     async def apply_status(self, issue: dict, state_id: str) -> None:
         try:
-            data = await self.gql(M_STATE, {"id": issue["id"], "stateId": state_id})
+            data = await self._gql_for_issue(
+                issue, M_STATE, {"id": issue["id"], "stateId": state_id}
+            )
             new_state = data["issueUpdate"]["issue"]["state"]
         except Exception as e:
             self.notify(f"update failed: {e}", severity="error")
             return
         issue["state"] = new_state
-        self._write_team_cache()
-        self.render_issues(keep=issue["id"])
-        if self._detail_issue and self._detail_issue["id"] == issue["id"]:
+        self._write_team_cache(issue)
+        self.render_issues(keep=self._issue_key(issue))
+        if self._detail_issue and self._issue_key(self._detail_issue) == self._issue_key(issue):
             self._update_detail_meta(issue)
         self.notify(f" {issue['identifier']} → {new_state['name']}")
 
     @work(group="mutate")
     async def apply_priority(self, issue: dict, p: int) -> None:
         try:
-            await self.gql(M_PRIORITY, {"id": issue["id"], "p": p})
+            await self._gql_for_issue(
+                issue, M_PRIORITY, {"id": issue["id"], "p": p}
+            )
         except Exception as e:
             self.notify(f"update failed: {e}", severity="error")
             return
         issue["priority"] = p
-        self._write_team_cache()
-        self.render_issues(keep=issue["id"])
-        if self._detail_issue and self._detail_issue["id"] == issue["id"]:
+        self._write_team_cache(issue)
+        self.render_issues(keep=self._issue_key(issue))
+        if self._detail_issue and self._issue_key(self._detail_issue) == self._issue_key(issue):
             self._update_detail_meta(issue)
         self.notify(f" {issue['identifier']} → {priority_name(p)}")
 
     @work(group="mutate")
     async def apply_assignee(self, issue: dict, assignee_id: str | None) -> None:
         try:
-            data = await self.gql(
-                M_ASSIGN, {"id": issue["id"], "assigneeId": assignee_id}
+            data = await self._gql_for_issue(
+                issue, M_ASSIGN, {"id": issue["id"], "assigneeId": assignee_id}
             )
             new_assignee = data["issueUpdate"]["issue"]["assignee"]
         except Exception as e:
             self.notify(f"update failed: {e}", severity="error")
             return
         issue["assignee"] = new_assignee
-        self._write_team_cache()
-        self.render_issues(keep=issue["id"])
-        if self._detail_issue and self._detail_issue["id"] == issue["id"]:
+        self._write_team_cache(issue)
+        self.render_issues(keep=self._issue_key(issue))
+        if self._detail_issue and self._issue_key(self._detail_issue) == self._issue_key(issue):
             self._update_detail_meta(issue)
         name = (new_assignee or {}).get("displayName") or "unassigned"
         self.notify(f"\uf007 {issue['identifier']} → {name}")
@@ -1902,31 +2729,40 @@ class LTUI(App):
     @work(group="mutate")
     async def create_issue(self, team: dict, title: str, desc: str | None) -> None:
         try:
-            data = await self.gql(
-                M_CREATE, {"teamId": team["id"], "title": title, "desc": desc}
+            data = await self._gql_for_team(
+                team,
+                M_CREATE,
+                {"teamId": team["id"], "title": title, "desc": desc},
             )
             issue = data["issueCreate"]["issue"]
         except Exception as e:
             self.notify(f"create failed: {e}", severity="error")
             return
-        if self._team is None or self._team["id"] != team["id"]:
+        if not self._is_all_workspaces and (
+            self._team is None or self._team["id"] != team["id"]
+        ):
             self.notify(f" created {issue['identifier']}")
             return
+        if self._is_all_workspaces:
+            issue = dict(issue)
+            issue["_workspace"] = self._team_workspace(team)
         self._issues.insert(0, issue)
-        self._issue_by_id[issue["id"]] = issue
-        self._write_team_cache()
-        self.render_issues(keep=issue["id"])
+        self._issue_by_id[self._issue_key(issue)] = issue
+        self._write_team_cache(issue)
+        self.render_issues(keep=self._issue_key(issue))
         self.notify(f" created {issue['identifier']}")
 
     @work(group="mutate")
     async def submit_comment(self, issue: dict, body: str) -> None:
         try:
-            await self.gql(M_COMMENT, {"id": issue["id"], "body": body})
+            await self._gql_for_issue(
+                issue, M_COMMENT, {"id": issue["id"], "body": body}
+            )
         except Exception as e:
             self.notify(f"comment failed: {e}", severity="error")
             return
         self.notify(f" comment added to {issue['identifier']}")
-        if self._detail_issue and self._detail_issue["id"] == issue["id"]:
+        if self._detail_issue and self._issue_key(self._detail_issue) == self._issue_key(issue):
             self.load_comments(issue)
 
     # ── rendering ─────────────────────────────────────────────────────
@@ -1941,17 +2777,24 @@ class LTUI(App):
         width = max(ol.content_size.width - 2, 40)
         flt = self._filter.lower()
         issues = self._issues
-        if self._mine and self._viewer_id:
+        def viewer_id(issue: dict) -> str | None:
+            if self._is_all_workspaces:
+                viewer = self._workspace_viewers.get(self._issue_workspace(issue), {})
+                return viewer.get("id")
+            return self._viewer_id
+
+        if self._mine:
             issues = [
                 i
                 for i in issues
-                if (i.get("assignee") or {}).get("id") == self._viewer_id
+                if viewer_id(i)
+                and (i.get("assignee") or {}).get("id") == viewer_id(i)
             ]
         if self._project_filter is not None:
             issues = [
                 i
                 for i in issues
-                if (i.get("project") or {}).get("id", "") == self._project_filter
+                if self._project_key(i) == self._project_filter
             ]
         if flt:
             issues = [
@@ -1964,45 +2807,75 @@ class LTUI(App):
                     + i["identifier"]
                     + " "
                     + ((i.get("assignee") or {}).get("displayName") or "")
+                    + " "
+                    + self._workspace_label(self._issue_workspace(i))
                 ).lower()
             ]
 
         def mine_first(i: dict):
-            is_mine = (i.get("assignee") or {}).get("id") == self._viewer_id
+            is_mine = (i.get("assignee") or {}).get("id") == viewer_id(i)
             return (0 if is_mine else 1, *issue_sort_key(i))
 
-        if self._group_by == "project":
+        if self._is_all_workspaces and self._group_by == "workspace":
+            by_workspace: dict[str, list[dict]] = {}
+            for issue in issues:
+                by_workspace.setdefault(self._issue_workspace(issue), []).append(issue)
+            groups = [
+                (
+                    self._workspace_header_row(
+                        profile.label,
+                        len(by_workspace.get(profile.name, [])),
+                        width,
+                    ),
+                    sorted(by_workspace.get(profile.name, []), key=mine_first),
+                )
+                for profile in self._profile_resolution.profiles
+                if by_workspace.get(profile.name)
+            ]
+        elif self._group_by == "project":
             # group by project; inside a project keep the status order,
             # then mine-first + recency
             by_proj: dict[str, list[dict]] = {}
             proj_of: dict[str, dict] = {}
             for i in issues:
                 p = i.get("project") or {"id": "", "name": "no project", "color": None}
-                by_proj.setdefault(p["id"], []).append(i)
-                proj_of[p["id"]] = p
+                pid = self._project_key(i)
+                by_proj.setdefault(pid, []).append(i)
+                tagged_project = dict(p)
+                tagged_project["_group_key"] = pid
+                proj_of[pid] = tagged_project
             # biggest projects first, the no-project bucket last
             ordered_groups = sorted(
                 proj_of.values(),
-                key=lambda p: (p["id"] == "", -len(by_proj[p["id"]])),
+                key=lambda p: (
+                    p["id"] == "",
+                    -len(by_proj[p["_group_key"]]),
+                ),
             )
             def in_group_key(i: dict):
                 return (state_sort_key(i["state"]), *mine_first(i))
             groups = [
-                (self._project_header_row(p, len(by_proj[p["id"]]), width),
-                 sorted(by_proj[p["id"]], key=in_group_key))
+                (self._project_header_row(p, len(by_proj[p["_group_key"]]), width),
+                 sorted(by_proj[p["_group_key"]], key=in_group_key))
                 for p in ordered_groups
             ]
         else:
             by_state: dict[str, list[dict]] = {}
             state_of: dict[str, dict] = {}
             for i in issues:
-                sid = i["state"]["id"]
+                sid = (
+                    scoped_id(self._issue_workspace(i), i["state"]["id"])
+                    if self._is_all_workspaces
+                    else i["state"]["id"]
+                )
                 by_state.setdefault(sid, []).append(i)
-                state_of[sid] = i["state"]
+                state = dict(i["state"])
+                state["_group_key"] = sid
+                state_of[sid] = state
             ordered_states = sorted(state_of.values(), key=state_sort_key)
             groups = [
-                (self._header_row(st, len(by_state[st["id"]]), width),
-                 sorted(by_state[st["id"]], key=mine_first))
+                (self._header_row(st, len(by_state[st["_group_key"]]), width),
+                 sorted(by_state[st["_group_key"]], key=mine_first))
                 for st in ordered_states
             ]
 
@@ -2019,8 +2892,9 @@ class LTUI(App):
             self._header_indices.append(len(opts))
             opts.append(Option(header, disabled=True))
             for i in group:
-                self._opt_index[i["id"]] = len(opts)
-                opts.append(Option(self._issue_row(i, width, id_w), id=i["id"]))
+                key = self._issue_key(i)
+                self._opt_index[key] = len(opts)
+                opts.append(Option(self._issue_row(i, width, id_w), id=key))
         if not opts:
             msg = "no matches" if flt else "no issues"
             opts.append(Option(Text(f"  {msg}", style=C_DIM), disabled=True))
@@ -2033,7 +2907,7 @@ class LTUI(App):
         if self._project_filter is not None:
             pname = next(
                 ((i.get("project") or {}).get("name") for i in self._issues
-                 if (i.get("project") or {}).get("id", "") == self._project_filter),
+                 if self._project_key(i) == self._project_filter),
                 "no project",
             ) or "no project"
             proj_tag = f" \uf07b {pname} \u00b7"
@@ -2044,6 +2918,28 @@ class LTUI(App):
             ol.highlighted = self._opt_index[keep]
         elif self._opt_index:
             ol.highlighted = min(self._opt_index.values())
+
+    def _workspace_label(self, profile: str) -> str:
+        try:
+            return self._profile(profile).label
+        except KeyError:
+            return profile
+
+    def _project_key(self, issue: dict) -> str:
+        project_id = (issue.get("project") or {}).get("id", "")
+        if self._is_all_workspaces:
+            return scoped_id(self._issue_workspace(issue), project_id)
+        return project_id
+
+    def _workspace_header_row(self, label: str, count: int, width: int) -> Text:
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append("◆ ", style=C_BLUE)
+        t.append(label, style=f"bold {C_BLUE}")
+        t.append(f" · {count} ", style=C_DIM)
+        fill = width - t.cell_len - 1
+        if fill > 0:
+            t.append("─" * fill, style=C_FAINT)
+        return t
 
     def _header_row(self, state: dict, count: int, width: int) -> Text:
         color = state["color"] or C_SUB
@@ -2070,6 +2966,12 @@ class LTUI(App):
     def _issue_row(self, issue: dict, width: int, id_w: int) -> Text:
         st = issue["state"]
         t = Text(no_wrap=True, overflow="ellipsis")
+        workspace_w = 0
+        if self._is_all_workspaces:
+            label = self._workspace_label(self._issue_workspace(issue))[:10]
+            workspace_w = len(label) + 3
+            t.append(f"{label} ", style=C_BLUE)
+            t.append("· ", style=C_VFAINT)
         t.append(f"{state_icon(st)} ", style=st["color"] or C_SUB)
         t.append(issue["identifier"].ljust(id_w), style=C_DIM)
         t.append(" ")
@@ -2086,7 +2988,7 @@ class LTUI(App):
             badges.append((" \uf06a", C_PEACH))  # blocking something
 
         right_w = 3 + 2 + 10 + 2 + 4  # prio, gap, assignee, gap, time
-        title_w = width - 2 - id_w - 1 - right_w - 1
+        title_w = width - workspace_w - 2 - id_w - 1 - right_w - 1
         dots_w = len(labels) * 2 + len(badges) * 2
         title = issue["title"]
         avail = max(title_w - dots_w, 8)
@@ -2199,6 +3101,10 @@ class LTUI(App):
     # ── events ────────────────────────────────────────────────────────
     @on(OptionList.OptionSelected, "#teams")
     def _team_selected(self, event: OptionList.OptionSelected) -> None:
+        option_id = event.option.id or ""
+        if self._is_all_workspaces and option_id.startswith("workspace:"):
+            self._begin_workspace_switch(option_id.removeprefix("workspace:"))
+            return
         team = next((t for t in self._teams if t["id"] == event.option.id), None)
         if team and (self._team is None or team["id"] != self._team["id"]):
             if self._detail_issue:
@@ -2222,8 +3128,158 @@ class LTUI(App):
         self.query_one("#issues").focus()
 
     # ── actions ───────────────────────────────────────────────────────
+    def action_switch_workspace(self) -> None:
+        resolution = self._profile_resolution
+        if resolution is None or len(resolution.profiles) < 2:
+            self.notify("configure two or more workspaces to switch", severity="warning")
+            return
+        if self._switching:
+            self.notify("workspace switch already in progress", severity="warning")
+            return
+        options: list[Option] = []
+        for profile in resolution.profiles:
+            row = Text("◆ ", style=C_BLUE if profile.name == self.active_workspace else C_DIM)
+            row.append(profile.label, style=C_TEXT)
+            if profile.name == self.active_workspace:
+                row.append("  ", style=C_GREEN)
+            options.append(Option(row, id=profile.name))
+        all_row = Text(
+            "◆ ", style=C_BLUE if self._is_all_workspaces else C_DIM
+        )
+        all_row.append("All workspaces", style=C_TEXT)
+        if self._is_all_workspaces:
+            all_row.append("  ", style=C_GREEN)
+        options.append(Option(all_row, id=ALL_WORKSPACES))
+
+        def selected(name: str | None) -> None:
+            if name:
+                self._begin_workspace_switch(name)
+
+        self.push_screen(PickerModal("switch workspace", options), selected)
+
+    def _begin_workspace_switch(self, name: str) -> bool:
+        if self._switching:
+            self.notify("workspace switch already in progress", severity="warning")
+            return False
+        if name == ALL_WORKSPACES:
+            if len(self._profile_resolution.profiles) < 2:
+                return False
+        else:
+            try:
+                self._profile(name)
+            except KeyError:
+                self.notify("unknown workspace", severity="error")
+                return False
+        if name == self.active_workspace:
+            return False
+        if any(
+            worker.group == "mutate"
+            and worker.state in (WorkerState.PENDING, WorkerState.RUNNING)
+            for worker in self.workers
+        ):
+            self.notify("finish the pending update before switching", severity="warning")
+            return False
+        # Set this synchronously, before the worker can yield, so a rapid second
+        # keypress cannot start an overlapping credential/client transaction.
+        self._switching = True
+        self._aggregate_generation += 1
+        self._switch_workspace_worker(name)
+        return True
+
+    @work(exclusive=True, group="workspace")
+    async def _switch_workspace_worker(self, name: str) -> None:
+        try:
+            cancelled = []
+            for group in ("boot", "issues", "detail", "members"):
+                cancelled.extend(self.workers.cancel_group(self, group))
+            for worker in dict.fromkeys(cancelled):
+                try:
+                    await worker.wait()
+                except WorkerCancelled:
+                    pass
+
+            if self.client is not None:
+                await self.client.aclose()
+                self.client = None
+
+            self._active_profile = name
+            await self._clear_workspace_data()
+            global_state = load_global_state(self._storage)
+            global_state["active_workspace"] = name
+            save_global_state(self._storage, global_state)
+            self._apply_profile_preferences()
+            self._update_profile()
+            if self._is_all_workspaces:
+                self._start_all_workspaces()
+            else:
+                self.query_one("#teams").border_title = " teams "
+                self._start(self._profile().api_key)
+        except Exception as error:
+            self.notify(f"workspace switch failed: {error}", severity="error", timeout=10)
+        finally:
+            self._switching = False
+
+    async def _clear_workspace_data(self) -> None:
+        self._teams = []
+        self._issues = []
+        self._states = []
+        self._members = {}
+        self._team_labels = {}
+        self._team_projects = {}
+        self._workspace_states = {}
+        self._workspace_viewers = {}
+        self._workspace_teams = {}
+        self._workspace_snapshots = {}
+        self._team = None
+        self._viewer_id = None
+        self._viewer_name = None
+        self._boot_data = None
+        self._org = None
+        self._filter = ""
+        self._project_filter = None
+        self._detail_issue = None
+        self._opt_index = {}
+        self._issue_by_id = {}
+        self._header_indices = []
+        self._group_starts = []
+        self._refreshing = False
+
+        teams = self.query_one("#teams", NavList)
+        issues = self.query_one("#issues", NavList)
+        teams.clear_options()
+        issues.clear_options()
+        issues.loading = False
+        filter_input = self.query_one("#filter", FilterInput)
+        filter_input.value = ""
+        filter_input.remove_class("visible")
+        centre = self.query_one("#centre")
+        centre.border_title = " issues "
+        centre.border_subtitle = ""
+        self.query_one("#appheader", Static).update("")
+        self.query_one("#d-title", Static).update("")
+        self.query_one("#d-meta", Static).update("")
+        self.query_one("#d-parent", Static).update("")
+        self.query_one("#d-parent").remove_class("visible")
+        self.query_one("#d-children").remove_class("visible")
+        await self.query_one("#d-children", Vertical).remove_children()
+        self.query_one("#d-desc", Markdown).update("")
+        self.query_one("#d-comments-head", Static).update("")
+        await self.query_one("#d-comments", Vertical).remove_children()
+        self.query_one("#detail").remove_class("open")
+        self.query_one("#split-right").remove_class("open")
+        self._update_profile()
+
     def action_refresh(self) -> None:
-        if self._team:
+        if self._is_all_workspaces and not self._switching:
+            if any(
+                worker.group == "mutate"
+                and worker.state in (WorkerState.PENDING, WorkerState.RUNNING)
+                for worker in self.workers
+            ):
+                self.notify("finish the pending update before refreshing")
+                return
+            self._start_all_workspaces()
+        elif self._team and not self._switching:
             self.load_team(self._team)
 
     def _tick_fx(self) -> None:
@@ -2257,6 +3313,7 @@ class LTUI(App):
 
     def _update_header(self) -> None:
         if self._org is None or self._viewer_name is None:
+            self.query_one("#appheader", Static).update("")
             return
         markup = (
             f"[bold {C_BLUE}] \uf03a [/]"
@@ -2274,17 +3331,26 @@ class LTUI(App):
         else:
             name = f"[bold {C_TEXT}]\u2026[/]"
         org = escape(self._org or "connecting")
+        workspace = "workspace"
+        if self._is_all_workspaces:
+            workspace = "All workspaces"
+        elif self._active_profile is not None and self._profile_resolution is not None:
+            workspace = escape(self._profile().label)
         mine = "on" if self._mine else "off"
         mine_color = C_GREEN if self._mine else C_DIM
         self.query_one("#profile", Static).update(
             " " + name + "\n"
             f"[{C_DIM}] {org}[/]\n"
+            f"[@click=app.switch_workspace][{C_BLUE}] ◆ {workspace}[/][/]\n"
             f"[@click=app.change_theme][{C_SUB}] [/][{C_SUB}]{self.theme}[/][/]\n"
             f"[@click=app.toggle_mine][{C_SUB}] mine [/][{mine_color}]{mine}[/][/]\n"
             f"[@click=app.open_settings][{C_BLUE}] settings[/][/]"
         )
 
     def action_open_settings(self) -> None:
+        if self._active_profile is None:
+            self.notify("configure a workspace before opening settings", severity="warning")
+            return
         if isinstance(self.screen, SettingsModal):
             return
         self.push_screen(SettingsModal())
@@ -2305,9 +3371,29 @@ class LTUI(App):
         self.notify(f" theme → {self.theme}")
 
     def action_new_ticket(self) -> None:
+        if self._is_all_workspaces:
+            options = []
+            for profile in self._profile_resolution.profiles:
+                team = self._workspace_teams.get(profile.name)
+                if team is None:
+                    continue
+                row = Text("◆ ", style=C_BLUE)
+                row.append(profile.label, style=C_TEXT)
+                row.append(f"  {team['key']}", style=C_DIM)
+                options.append(Option(row, id=profile.name))
+
+            def picked(profile_name: str | None) -> None:
+                if profile_name and profile_name in self._workspace_teams:
+                    self._open_new_ticket(self._workspace_teams[profile_name])
+
+            self.push_screen(PickerModal("new ticket · workspace", options), picked)
+            return
         team = self._team
         if team is None:
             return
+        self._open_new_ticket(team)
+
+    def _open_new_ticket(self, team: dict) -> None:
 
         def done(result: tuple | None) -> None:
             if result:
@@ -2320,8 +3406,9 @@ class LTUI(App):
         counts: dict[str, int] = {}
         for i in self._issues:
             p = i.get("project") or {"id": "", "name": "no project", "color": None}
-            projects[p["id"]] = p
-            counts[p["id"]] = counts.get(p["id"], 0) + 1
+            pid = self._project_key(i)
+            projects[pid] = p
+            counts[pid] = counts.get(pid, 0) + 1
         opts = []
         row = Text()
         row.append("\uf03a ", style=C_BLUE)
@@ -2391,7 +3478,16 @@ class LTUI(App):
             self.query_one("#d-scroll").focus()
 
     def action_toggle_group(self) -> None:
-        self._group_by = "project" if self._group_by == "status" else "status"
+        groups = (
+            ("workspace", "status", "project")
+            if self._is_all_workspaces
+            else ("status", "project")
+        )
+        try:
+            current = groups.index(self._group_by)
+        except ValueError:
+            current = -1
+        self._group_by = groups[(current + 1) % len(groups)]
         self._save_state()
         self.render_issues()
         self.notify(f"\uf0ca grouping by {self._group_by}")
@@ -2416,10 +3512,13 @@ class LTUI(App):
 
     def action_change_status(self) -> None:
         issue = self._current_issue()
-        if not issue or not self._states:
+        if not issue:
+            return
+        states = self._states_for_issue(issue)
+        if not states:
             return
         opts = []
-        for s in sorted(self._states, key=state_sort_key):
+        for s in sorted(states, key=state_sort_key):
             row = Text()
             row.append(f"{state_icon(s)} ", style=s["color"] or C_SUB)
             row.append(s["name"], style=C_TEXT)
@@ -2441,17 +3540,25 @@ class LTUI(App):
 
     @work(exclusive=True, group="members")
     async def open_labels(self, issue: dict) -> None:
-        team = self._team
-        labels = self._team_labels.get(team["id"])
+        team = self._team_for_issue(issue)
+        if team is None:
+            return
+        team_key = self._team_key(team)
+        labels = self._team_labels.get(team_key)
         if labels is None:
             try:
-                data = await self.gql(QL_TEAM_LABELS, {"teamId": team["id"]})
+                data = await self._gql_for_team(
+                    team, QL_TEAM_LABELS, {"teamId": team["id"]}
+                )
                 labels = data["team"]["labels"]["nodes"]
             except Exception as e:
                 self.notify(f"linear: {e}", severity="error")
                 return
-            self._team_labels[team["id"]] = labels
-        if self._team is None or self._team["id"] != team["id"]:
+            if self._switching:
+                return
+            self._team_labels[team_key] = labels
+        current_team = self._team_for_issue(issue)
+        if current_team is None or self._team_key(current_team) != team_key:
             return
         if not labels:
             self.notify("this team has no labels yet", severity="warning")
@@ -2472,16 +3579,16 @@ class LTUI(App):
     @work(group="mutate")
     async def apply_labels(self, issue: dict, label_ids: list) -> None:
         try:
-            data = await self.gql(
-                M_LABELS, {"id": issue["id"], "labelIds": label_ids}
+            data = await self._gql_for_issue(
+                issue, M_LABELS, {"id": issue["id"], "labelIds": label_ids}
             )
             issue["labels"] = data["issueUpdate"]["issue"]["labels"]
         except Exception as e:
             self.notify(f"update failed: {e}", severity="error")
             return
-        self._write_team_cache()
-        self.render_issues(keep=issue["id"])
-        if self._detail_issue and self._detail_issue["id"] == issue["id"]:
+        self._write_team_cache(issue)
+        self.render_issues(keep=self._issue_key(issue))
+        if self._detail_issue and self._issue_key(self._detail_issue) == self._issue_key(issue):
             self._update_detail_meta(issue)
         self.notify(f"\uf02b {issue['identifier']} \u00b7 labels updated")
 
@@ -2493,17 +3600,25 @@ class LTUI(App):
 
     @work(exclusive=True, group="members")
     async def open_project_picker(self, issue: dict) -> None:
-        team = self._team
-        projects = self._team_projects.get(team["id"])
+        team = self._team_for_issue(issue)
+        if team is None:
+            return
+        team_key = self._team_key(team)
+        projects = self._team_projects.get(team_key)
         if projects is None:
             try:
-                data = await self.gql(QL_TEAM_PROJECTS, {"teamId": team["id"]})
+                data = await self._gql_for_team(
+                    team, QL_TEAM_PROJECTS, {"teamId": team["id"]}
+                )
                 projects = data["team"]["projects"]["nodes"]
             except Exception as e:
                 self.notify(f"linear: {e}", severity="error")
                 return
-            self._team_projects[team["id"]] = projects
-        if self._team is None or self._team["id"] != team["id"]:
+            if self._switching:
+                return
+            self._team_projects[team_key] = projects
+        current_team = self._team_for_issue(issue)
+        if current_team is None or self._team_key(current_team) != team_key:
             return
         current = (issue.get("project") or {}).get("id")
         opts = []
@@ -2547,32 +3662,37 @@ class LTUI(App):
 
     @work(group="mutate")
     async def create_project_and_assign(self, issue: dict, name: str) -> None:
-        team = self._team
+        team = self._team_for_issue(issue)
+        if team is None:
+            return
+        team_key = self._team_key(team)
         try:
-            data = await self.gql(
-                M_PROJECT_CREATE, {"name": name, "teamIds": [team["id"]]}
+            data = await self._gql_for_issue(
+                issue,
+                M_PROJECT_CREATE,
+                {"name": name, "teamIds": [team["id"]]},
             )
             project = data["projectCreate"]["project"]
         except Exception as e:
             self.notify(f"create project failed: {e}", severity="error")
             return
-        self._team_projects.setdefault(team["id"], []).append(project)
+        self._team_projects.setdefault(team_key, []).append(project)
         self.notify(f"\uf07b created project {project['name']}")
         self.apply_project(issue, project["id"])
 
     @work(group="mutate")
     async def apply_project(self, issue: dict, project_id: str | None) -> None:
         try:
-            data = await self.gql(
-                M_PROJECT, {"id": issue["id"], "projectId": project_id}
+            data = await self._gql_for_issue(
+                issue, M_PROJECT, {"id": issue["id"], "projectId": project_id}
             )
             issue["project"] = data["issueUpdate"]["issue"]["project"]
         except Exception as e:
             self.notify(f"update failed: {e}", severity="error")
             return
-        self._write_team_cache()
-        self.render_issues(keep=issue["id"])
-        if self._detail_issue and self._detail_issue["id"] == issue["id"]:
+        self._write_team_cache(issue)
+        self.render_issues(keep=self._issue_key(issue))
+        if self._detail_issue and self._issue_key(self._detail_issue) == self._issue_key(issue):
             self._update_detail_meta(issue)
         pname = (issue.get("project") or {}).get("name") or "no project"
         self.notify(f"\uf07b {issue['identifier']} \u2192 {pname}")
@@ -2598,35 +3718,50 @@ class LTUI(App):
 
     def action_change_assignee(self) -> None:
         issue = self._current_issue()
-        if not issue or self._team is None:
+        if not issue or self._team_for_issue(issue) is None:
             return
         self.pick_assignee(issue)
 
     @work(exclusive=True, group="members")
     async def pick_assignee(self, issue: dict) -> None:
-        team = self._team
-        members = self._members.get(team["id"])
+        team = self._team_for_issue(issue)
+        if team is None:
+            return
+        team_key = self._team_key(team)
+        members = self._members.get(team_key)
         if members is None:
             try:
-                data = await self.gql(QL_MEMBERS, {"teamId": team["id"]})
+                data = await self._gql_for_team(
+                    team, QL_MEMBERS, {"teamId": team["id"]}
+                )
                 members = data["team"]["members"]["nodes"]
             except Exception as e:
                 self.notify(f"linear: {e}", severity="error")
                 return
-            self._members[team["id"]] = members
-        if self._team is None or self._team["id"] != team["id"]:
+            if self._switching:
+                return
+            self._members[team_key] = members
+        current_team = self._team_for_issue(issue)
+        if current_team is None or self._team_key(current_team) != team_key:
             return  # user switched teams while fetching
         current = (issue.get("assignee") or {}).get("id")
         opts = []
-        if self._viewer_id:
+        viewer = (
+            self._workspace_viewers.get(self._issue_workspace(issue), {})
+            if self._is_all_workspaces
+            else {"id": self._viewer_id, "displayName": self._viewer_name}
+        )
+        viewer_id = viewer.get("id")
+        viewer_name = viewer.get("displayName")
+        if viewer_id:
             row = Text(no_wrap=True, overflow="ellipsis")
             row.append("\uf007 ", style=C_BLUE)
-            row.append(f"me ({self._viewer_name})", style=C_TEXT)
-            if self._viewer_id == current:
+            row.append(f"me ({viewer_name})", style=C_TEXT)
+            if viewer_id == current:
                 row.append("  \uf00c", style=C_GREEN)
-            opts.append(Option(row, id=self._viewer_id))
+            opts.append(Option(row, id=viewer_id))
         for m in members:
-            if m["id"] == self._viewer_id:
+            if m["id"] == viewer_id:
                 continue
             row = Text(no_wrap=True, overflow="ellipsis")
             row.append("\uf007 ", style=C_MAUVE)
@@ -2705,12 +3840,13 @@ config: ~/.config/ltui/config.json remaps any keybind and sets options
         (auto_refresh_seconds, animations). ltui --init-config writes a
         starter file. changes apply on restart.
 
-auth: LINEAR_API_KEY env var, ~/.config/ltui/config.toml, or
-      linear-cli's config. no key? ltui asks on first launch.
+auth: LINEAR_API_KEY env var, [workspaces.*] profiles (or legacy api_key)
+      in ~/.config/ltui/config.toml, then linear-cli's config.
+      use one API key per Linear workspace; chmod the TOML file to 600.
 
 keys: enter open ticket   n new   s status   p priority   c comment
       a assign   l labels   P project   o browser   y yank   / filter
-      m mine only   v group
+      w workspace / All view   m mine only   v group
       V one project   t theme
       , settings   j/k navigate   g/G top/bottom   r refresh   ? help
       q quit

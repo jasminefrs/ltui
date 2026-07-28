@@ -215,11 +215,19 @@ class DemoApp(LTUI):
 
 
 def patch(theme="mocha"):
-    mod.load_api_key = lambda: "demo"
-    mod.read_cache = lambda name: None
-    mod.write_cache = lambda name, data: None
-    mod.load_state = lambda: {"theme": theme, "mine": False, "team_id": "t-core", "welcomed": True}
-    mod.save_state = lambda data: None
+    profile = mod.WorkspaceProfile("demo", "Demo", "demo")
+    mod.resolve_workspace_profiles = lambda storage=mod.DEFAULT_STORAGE: (
+        mod.ProfileResolution((profile,), "demo", "multi")
+    )
+    mod.read_cache = lambda *args, **kwargs: None
+    mod.write_cache = lambda *args, **kwargs: None
+    mod.load_state = lambda *args, **kwargs: {
+        "theme": theme,
+        "mine": False,
+        "team_id": "t-core",
+        "welcomed": True,
+    }
+    mod.save_state = lambda *args, **kwargs: None
 
 
 async def shot(name, size=(148, 41), theme="mocha", drive=None):
@@ -275,9 +283,9 @@ async def open_settings(app, pilot):
 
 async def onboard_shot(name, size=(148, 41)):
     patch("mocha")
-    def no_key():
-        raise FileNotFoundError("no key configured")
-    mod.load_api_key = no_key
+    def no_key(storage=mod.DEFAULT_STORAGE):
+        raise mod.CredentialsNotFound("no key configured")
+    mod.resolve_workspace_profiles = no_key
     app = DemoApp()
     async with app.run_test(size=size) as pilot:
         await pilot.pause(0.6)
@@ -288,7 +296,11 @@ async def onboard_shot(name, size=(148, 41)):
 async def welcome_shot(name, size=(148, 41)):
     patch("mocha")
     # no "welcomed" key → the first-launch tour card shows
-    mod.load_state = lambda: {"theme": "mocha", "mine": False, "team_id": "t-core"}
+    mod.load_state = lambda *args, **kwargs: {
+        "theme": "mocha",
+        "mine": False,
+        "team_id": "t-core",
+    }
     app = DemoApp()
     async with app.run_test(size=size) as pilot:
         for _ in range(40):

@@ -54,6 +54,7 @@ launch. ltui doesn't:
 | 👥  | **assign without leaving** — `a` reassigns to anyone on the team, or you, or nobody |
 | 🌳  | **hierarchy aware** — the detail panel shows the parent ticket and all sub-issues with a done-count, next to blocked/blocking relations |
 | 🔄  | **never stale** — the board silently re-syncs every 3 minutes |
+| 🔀  | **multiple workspaces + combined inbox** — configure one key per Linear workspace, then press `w` to switch or see every workspace together |
 | 📖  | **rich detail panel** — full markdown descriptions (code blocks, checklists, quotes), labels, comments — scrolls with arrows, vim keys, or mouse wheel |
 | ✏️  | **write, don't just read** — create tickets, change status & priority, add comments without leaving the terminal |
 | 🚧  | **blocked & blocking at a glance** — a red badge on tickets that are blocked, an orange one on tickets holding others up; the detail panel names the exact tickets |
@@ -122,9 +123,69 @@ key, done — ltui validates it live and stores it in
 already set up somewhere? ltui checks, in order:
 
 1. the `LINEAR_API_KEY` environment variable
-2. its own `~/.config/ltui/config.toml`
-3. your [linear-cli](https://github.com/Finesssee/linear-cli) config — if you
+2. `[workspaces.*]` profiles in its own `~/.config/ltui/config.toml`
+3. the legacy top-level `api_key` in that same file
+4. your [linear-cli](https://github.com/Finesssee/linear-cli) config — if you
    already use linear-cli, ltui logs in with zero setup
+
+### multiple workspaces
+
+Linear API keys are workspace-specific, so create one key in each workspace
+and put them in `~/.config/ltui/config.toml`:
+
+```toml
+default_workspace = "work"
+
+[workspaces.work]
+label = "Acme"
+api_key = "lin_api_your_work_key"
+
+[workspaces.personal]
+label = "Personal"
+api_key = "lin_api_your_personal_key"
+```
+
+Protect the file, then restart ltui:
+
+```sh
+chmod 600 ~/.config/ltui/config.toml
+```
+
+Press `w` (or click the workspace name in the profile card) to switch. The
+picker also includes **All workspaces**, which merges the remembered team from
+every configured workspace into one interactive board. Issue rows carry a
+workspace badge, and `v` cycles through workspace, status, and project
+grouping. Duplicate Linear ids from different workspaces remain separate.
+
+The combined board is not read-only: opening details, adding comments, and
+changing an issue always use the API key for that issue's source workspace.
+`m` applies “mine only” using your identity in each workspace, and `n` asks
+which workspace should receive the new ticket. Cached data appears immediately
+while all workspaces refresh concurrently; if one refresh fails, the others
+remain usable and that workspace's valid cache is retained. In Settings,
+**clear all caches** clears the real workspace caches without deleting your
+profiles or combined-view preferences.
+
+ltui remembers the active workspace or combined view and restores it on every
+device independently. Each real workspace keeps its own selected team, theme,
+grouping, mine-only preference, layout, and cached issues; the combined view
+keeps separate display preferences.
+
+On multiple Macs, copy the same protected `config.toml` to each one. You can
+reuse each workspace's API key across your own devices; if you revoke a key,
+replace that profile's value on every Mac.
+
+`default_workspace` is optional; without it, the first profile is used. A
+saved active workspace takes precedence when it still exists. The
+`LINEAR_API_KEY` environment variable intentionally overrides the entire file
+and creates a single temporary `Environment` profile, so unset it when you want
+the in-app workspace picker.
+
+Existing single-workspace files remain valid:
+
+```toml
+api_key = "lin_api_your_key"
+```
 
 Your key never leaves your machine — ltui talks directly to
 `api.linear.app` and nothing else.
@@ -144,7 +205,7 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 | `←` `→`  | walk the panes: teams ◂ issues ▸ detail — `→` on a ticket opens it |
 | `enter` / click | open ticket detail panel                |
 | `esc`    | close panel / dismiss modal / clear filter    |
-| `n`      | **new ticket** in the current team            |
+| `n`      | **new ticket** (prompts for a workspace in All) |
 | `s`      | change **status**                             |
 | `p`      | change **priority**                           |
 | `a`      | change **assignee** (or unassign)             |
@@ -154,8 +215,9 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 | `o`      | open ticket in **browser**                    |
 | `y`      | **yank** — copy branch name / url / id        |
 | `/`      | filter issues                                 |
+| `w`      | switch **workspace / All workspaces view**      |
 | `m`      | toggle **mine only**                          |
-| `v`      | group by **status / project**                 |
+| `v`      | group by **workspace / status / project**     |
 | `V`      | filter to a **single project**                |
 | `t`      | cycle **theme**                               |
 | `,`      | open **settings**                             |
@@ -169,10 +231,11 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 
 ## project view
 
-`v` flips the board from status columns to **projects** — each project gets a
-color-coded section (freshest work first, status order inside), with tickets
-that belong to no project collected at the bottom. Press `v` again to go back —
-or `V` to zoom into a **single project** (works in either grouping).
+In a single workspace, `v` flips the board between status and **projects**. In
+**All workspaces**, it cycles through workspace, status, and project sections.
+Each project gets a color-coded section (freshest work first, status order
+inside), with tickets that belong to no project collected at the bottom. Press
+`V` to zoom into a **single project** in any grouping.
 
 <div align="center">
 <img src="assets/projects.png" alt="group by project" width="80%">
@@ -190,6 +253,7 @@ ltui --init-config    # writes ~/.config/ltui/config.json
 {
   "keybinds": {
     "new_ticket": "n",            // any action -> any key
+    "switch_workspace": "w",
     "yank": ["y", "ctrl+y"]       // or several keys
   },
   "options": {
@@ -225,9 +289,10 @@ slot it into the right column.
 
 ## settings
 
-Your profile lives bottom-left — name, org, and one-click toggles for theme
-and mine-only. Press `,` (or click ` settings`) for the panel:
-flip preferences, clear the cache.
+Your profile lives bottom-left — workspace, name, org, and one-click toggles
+for theme and mine-only. Press `,` (or click ` settings`) for the panel: switch
+workspace, flip preferences, or clear the active workspace's cache. From the
+combined view, the same action is labeled **clear all caches**.
 
 <div align="center">
 <img src="assets/settings.png" alt="settings panel" width="80%">
@@ -273,7 +338,7 @@ launch ──▶ render cached issues (~50ms) ──▶ you're already working
                     └──▶ background refresh ──▶ rows swap in silently
 ```
 
-- issue lists cache to `~/.cache/ltui/` per team
+- issue lists cache to `~/.cache/ltui/<workspace>/` per team
 - mutations (status, priority, new tickets) update the cache immediately —
   what you see is always what you did
 - the `↻ refreshing` badge in the border tells you when fresh data is inbound
@@ -285,8 +350,9 @@ launch ──▶ render cached issues (~50ms) ──▶ you're already working
 - **writes**: only the mutations you explicitly trigger (create / status /
   priority / comment)
 - **talks to**: `api.linear.app` — nothing else, no telemetry, no analytics
-- **stores locally**: cache in `~/.cache/ltui/`, UI state in
-  `~/.local/state/ltui/state.json`
+- **stores locally**: cache in `~/.cache/ltui/<workspace>/`, workspace UI state
+  in `~/.local/state/ltui/workspaces/<workspace>.json`, and the active profile
+  name (never its key) in `~/.local/state/ltui/global.json`
 
 ## faq
 
@@ -319,9 +385,10 @@ terminal font. Everything else degrades gracefully.
 <details>
 <summary><b>Does it work with multiple workspaces?</b></summary>
 
-It uses one API key at a time (the linear-cli "current" workspace, or
-<code>LINEAR_API_KEY</code>). Switch workspaces the same way you would with
-linear-cli.
+Yes. Add one API key per workspace under <code>[workspaces.*]</code> in
+<code>~/.config/ltui/config.toml</code>, then press <code>w</code>. The picker
+shows labels only—never API keys—and every workspace has isolated cache and UI
+state. See <a href="#multiple-workspaces">multiple workspaces</a> above.
 
 </details>
 

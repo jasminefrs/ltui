@@ -84,6 +84,17 @@ git clone https://github.com/runpantheon/ltui && cd ltui/ltui
 pip install .
 ```
 
+To run an edited checkout directly from the repository root without
+reinstalling it, point `uv` at the inner Python project:
+
+```sh
+uv run --directory ltui ltui
+```
+
+Plain `uv run ltui` only discovers the project when your current directory is
+that inner `ltui/` directory; otherwise it may run an older globally installed
+copy from `~/.local/bin`.
+
 either way you now have the command:
 
 ```sh
@@ -335,12 +346,14 @@ Cycle with `t`. Your choice sticks.
 
 Two of them can't be screenshotted honestly:
 
-- **`clear`** paints **no background at all** — ltui runs on your terminal's
-  own background, so if your terminal is transparent or blurred, ltui is too.
+- **`clear`** paints **no background at all** and uses the terminal's default
+  foreground for task text, so both light and dark terminal themes remain
+  readable. If your terminal is transparent or blurred, ltui is too.
 - **`system`** goes further: the whole UI chrome is drawn in your terminal's
   **ANSI palette** (plus the transparent background) — whatever theme your
   kitty/alacritty/ghostty is running, ltui matches it automatically. Ticket
-  data (state colors, labels) stays true to Linear.
+  data (state colors, labels) stays true to Linear. Selected rows use terminal
+  reverse-video colors for reliable contrast on both light and dark palettes.
 
 Made for rice.
 

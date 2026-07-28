@@ -26,6 +26,8 @@ from pathlib import Path
 
 import httpx
 from rich.markup import escape
+from rich.segment import Segment
+from rich.style import Style
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -34,6 +36,7 @@ from textual.color import Color as TColor
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme
+from textual.strip import Strip
 from textual.widgets import Button, Footer, Input, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.worker import WorkerCancelled, WorkerState
@@ -96,9 +99,16 @@ _PALETTE = dict(
     C_MAUVE=C_MAUVE,
 )
 _PALETTE_ANSI = dict(
-    C_TEXT="default", C_SUB="white", C_DIM="bright_black", C_FAINT="bright_black",
+    C_TEXT="default", C_SUB="default", C_DIM="bright_black", C_FAINT="bright_black",
     C_VFAINT="bright_black", C_BLUE="blue", C_LAV="bright_blue", C_PEACH="yellow",
     C_GREEN="green", C_RED="red", C_MAUVE="magenta",
+)
+TERMINAL_THEMES = frozenset(("clear", "system"))
+TERMINAL_SELECTION_STYLE = Style(
+    color="default",
+    bgcolor="default",
+    bold=True,
+    reverse=True,
 )
 
 
@@ -183,7 +193,7 @@ THEMES = [
             "ltui-border": "#3c3f4a",
             "ltui-border-focus": "#8a93a5",
             "ltui-border-detail": "#a9b1c0",
-            "ltui-modal-bg": "#16161d",
+            "ltui-modal-bg": "ansi_default",
             "ltui-cursor": "#282c38",
             "ltui-overlay": "transparent",
             "scrollbar": "#3c3f4a",
@@ -206,7 +216,7 @@ THEMES = [
             "ltui-border": "ansi_bright_black",
             "ltui-border-focus": "ansi_blue",
             "ltui-border-detail": "ansi_bright_blue",
-            "ltui-modal-bg": "ansi_black",
+            "ltui-modal-bg": "ansi_default",
             "ltui-cursor": "ansi_bright_black",
             "ltui-overlay": "transparent",
             "scrollbar": "ansi_bright_black",
@@ -898,8 +908,7 @@ def state_icon(state: dict) -> str:
 def priority_cell(p: int) -> Text:
     t = Text()
     if p == 1:
-        t.append(" ", style=f"bold {C_PEACH}")
-        t.append("  ")
+        t.append("!!!", style=f"bold {C_RED}")
     elif p in (2, 3, 4):
         lit = {2: 3, 3: 2, 4: 1}[p]
         for i, ch in enumerate("▂▄▆"):
@@ -1214,6 +1223,26 @@ class NavList(OptionList):
         # The reactive watcher does not run when the first item was already
         # highlighted (for example after mouse-wheel scrolling).
         self._reveal_leading_rows()
+
+    def render_line(self, y: int) -> Strip:
+        strip = super().render_line(y)
+        if getattr(self.app, "theme", None) not in TERMINAL_THEMES:
+            return strip
+        line_number = self.scroll_offset.y + y
+        try:
+            option_index, _line_offset = self._lines[line_number]
+            option = self.get_option_at_index(option_index)
+        except (IndexError, KeyError):
+            return strip
+        if option.disabled or option_index != self.highlighted:
+            return strip
+        return Strip(
+            Segment.apply_style(
+                strip,
+                post_style=TERMINAL_SELECTION_STYLE,
+            ),
+            strip.cell_length,
+        )
 
     def _snap_to_enabled(self, direction: int) -> None:
         """Page motions can land on a disabled header; nudge to a real row."""
@@ -2422,7 +2451,7 @@ class LTUI(App):
     def _on_theme_changed(self, _theme) -> None:
         # ansi-background themes (clear, ansi-dark, …) need ansi_color mode
         # so default-color codes pass through and the terminal bg shows
-        set_palette(self.theme == "system")
+        set_palette(self.theme in TERMINAL_THEMES)
         self.ansi_color = self._theme_is_ansi()
         if self._boot_data is not None:
             self._render_boot(self._boot_data)

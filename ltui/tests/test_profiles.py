@@ -749,6 +749,79 @@ class GroupedHeaderScrollTests(unittest.IsolatedAsyncioTestCase):
                 )
 
 
+class ThemeReadabilityTests(unittest.IsolatedAsyncioTestCase):
+    def tearDown(self) -> None:
+        ltui.set_palette(False)
+
+    def test_urgent_priority_has_a_visible_marker(self) -> None:
+        marker = ltui.priority_cell(1)
+
+        self.assertEqual(marker.plain, "!!!")
+        self.assertTrue(marker.spans)
+
+    def test_transparent_theme_modals_use_terminal_background(self) -> None:
+        themes = {theme.name: theme for theme in ltui.THEMES}
+
+        for name in ltui.TERMINAL_THEMES:
+            with self.subTest(theme=name):
+                self.assertEqual(
+                    themes[name].variables["ltui-modal-bg"],
+                    "ansi_default",
+                )
+
+    async def test_transparent_themes_use_terminal_text_and_reverse_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            storage = ltui.StoragePaths(
+                config=root / "config.toml",
+                linear_config=root / "linear.toml",
+                state_root=root / "state",
+                cache_root=root / "cache",
+            )
+            ltui.save_state(storage, "work", {"welcomed": True})
+            app = ltui.LTUI(
+                profile_resolution(),
+                storage,
+                lambda key: FakeClient(key),
+            )
+            async with app.run_test(size=(80, 18)) as pilot:
+                await wait_for_workers(app)
+                issue = aggregate_issue("Work")
+                app._set_issues(
+                    [issue],
+                    [issue["state"]],
+                    aggregate_cycles("Work"),
+                    True,
+                )
+                app.render_issues()
+
+                app.theme = "clear"
+                await pilot.pause()
+                self.assertEqual(ltui.C_TEXT, "default")
+                self.assertEqual(ltui.C_SUB, "default")
+
+                app.theme = "system"
+                await pilot.pause()
+                issue_list = app.query_one("#issues", ltui.NavList)
+                highlighted = issue_list.highlighted
+                self.assertIsNotNone(highlighted)
+                line = (
+                    issue_list._index_to_line[highlighted]
+                    - issue_list.scroll_offset.y
+                )
+                visible_segments = [
+                    segment
+                    for segment in issue_list.render_line(line)
+                    if segment.text.strip()
+                ]
+                self.assertTrue(visible_segments)
+                for segment in visible_segments:
+                    with self.subTest(text=segment.text):
+                        self.assertTrue(segment.style.reverse)
+                        self.assertTrue(segment.style.color.is_default)
+                        self.assertTrue(segment.style.bgcolor.is_default)
+
+
 class CycleViewTests(unittest.TestCase):
     def test_issue_and_cycle_queries_are_split_below_complexity_limit(self) -> None:
         for field in (

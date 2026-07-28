@@ -117,9 +117,29 @@ P_SYNC = {"id": "p-sync", "name": "Sync Engine v2", "color": "#89b4fa"}
 P_POLISH = {"id": "p-polish", "name": "Q3 Polish", "color": "#cba6f7"}
 P_INFRA = {"id": "p-infra", "name": "Infra Hardening", "color": "#a6e3a1"}
 
+C_PREVIOUS = {
+    "id": "cy-11", "name": "Stabilize", "number": 11,
+    "startsAt": ago(days=28), "endsAt": ago(days=15),
+    "isActive": False, "isFuture": False, "isPast": True,
+    "isPrevious": True, "isNext": False,
+}
+C_CURRENT = {
+    "id": "cy-12", "name": "Ship it", "number": 12,
+    "startsAt": ago(days=7), "endsAt": ago(days=-7),
+    "isActive": True, "isFuture": False, "isPast": False,
+    "isPrevious": False, "isNext": False,
+}
+C_NEXT = {
+    "id": "cy-13", "name": "Polish", "number": 13,
+    "startsAt": ago(days=-8), "endsAt": ago(days=-21),
+    "isActive": False, "isFuture": True, "isPast": False,
+    "isPrevious": False, "isNext": True,
+}
+CYCLES = [C_PREVIOUS, C_CURRENT, C_NEXT]
+
 
 def issue(num, title, state, prio, assignee, labels, up_h, created_d=20, desc=None,
-          blocks=(), blocked_by=(), parent=None, project=None):
+          blocks=(), blocked_by=(), parent=None, project=None, cycle=None):
     return {
         "id": f"i-{num}",
         "identifier": f"CORE-{num}",
@@ -141,16 +161,17 @@ def issue(num, title, state, prio, assignee, labels, up_h, created_d=20, desc=No
         ]},
         "parent": parent,
         "project": project,
+        "cycle": cycle,
     }
 
 
 ISSUES = [
     # in review
-    issue(128, "Split sync engine into per-entity pipelines", "st-ir", 1, NOVA, [L_INFRA], 3, desc=DESC, blocked_by=["CORE-134"], parent={"identifier": "CORE-100"}, project=P_SYNC),
+    issue(128, "Split sync engine into per-entity pipelines", "st-ir", 1, NOVA, [L_INFRA], 3, desc=DESC, blocked_by=["CORE-134"], parent={"identifier": "CORE-100"}, project=P_SYNC, cycle=C_CURRENT),
     issue(131, "Rate-limit invite spam from unverified workspaces", "st-ir", 2, KAI, [L_BUG], 6, blocked_by=["CORE-130"]),
     issue(119, "New onboarding checklist — empty states + confetti", "st-ir", 3, REI, [L_UX, L_FEAT], 11, project=P_POLISH),
     # in progress
-    issue(134, "Streaming exports: cursor pagination for 1M+ row tables", "st-ip", 1, NOVA, [L_FEAT], 1, blocks=["CORE-128"], project=P_SYNC),
+    issue(134, "Streaming exports: cursor pagination for 1M+ row tables", "st-ip", 1, NOVA, [L_FEAT], 1, blocks=["CORE-128"], project=P_SYNC, cycle=C_CURRENT),
     issue(133, "Fix flaky websocket reconnect on laptop sleep", "st-ip", 2, NOVA, [L_BUG], 4),
     issue(127, "Migrate search to the new tokenizer", "st-ip", 2, KAI, [L_INFRA], 9, project=P_SYNC),
     issue(125, "Command palette: fuzzy match on ticket identifiers", "st-ip", 3, REI, [L_FEAT, L_UX], 14, project=P_POLISH),
@@ -185,7 +206,21 @@ class DemoApp(LTUI):
         if "organization" in query:
             return BOOT
         if "issues(first" in query:
-            return {"team": {"issues": {"nodes": ISSUES}, "states": {"nodes": STATES}}}
+            return {
+                "team": {
+                    "issues": {"nodes": ISSUES},
+                    "states": {"nodes": STATES},
+                }
+            }
+        if "cycles(first" in query:
+            return {
+                "team": {
+                    "cycles": {
+                        "nodes": CYCLES,
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                }
+            }
         if "members(first" in query:
             return {"team": {"members": {"nodes": [NOVA, KAI, REI]}}}
         if "labels(first: 100" in query:

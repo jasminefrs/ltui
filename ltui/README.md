@@ -55,6 +55,7 @@ launch. ltui doesn't:
 | 🌳  | **hierarchy aware** — the detail panel shows the parent ticket and all sub-issues with a done-count, next to blocked/blocking relations |
 | 🔄  | **never stale** — the board silently re-syncs every 3 minutes |
 | 🔀  | **multiple workspaces + combined inbox** — configure one key per Linear workspace, then press `w` to switch or see every workspace together |
+| 🎯  | **focused views** — Active shows only Todo + Started; `F` selects any status combination, `d` shows or hides Done, and `C` filters by current, next, previous, no cycle, or a named cycle |
 | 📖  | **rich detail panel** — full markdown descriptions (code blocks, checklists, quotes), labels, comments — scrolls with arrows, vim keys, or mouse wheel |
 | ✏️  | **write, don't just read** — create tickets, change status & priority, add comments without leaving the terminal |
 | 🚧  | **blocked & blocking at a glance** — a red badge on tickets that are blocked, an orange one on tickets holding others up; the detail panel names the exact tickets |
@@ -168,8 +169,8 @@ profiles or combined-view preferences.
 
 ltui remembers the active workspace or combined view and restores it on every
 device independently. Each real workspace keeps its own selected team, theme,
-grouping, mine-only preference, layout, and cached issues; the combined view
-keeps separate display preferences.
+grouping, mine-only preference, status view, cycle view, layout, and cached
+issues; the combined view keeps separate display preferences.
 
 On multiple Macs, copy the same protected `config.toml` to each one. You can
 reuse each workspace's API key across your own devices; if you revoke a key,
@@ -217,6 +218,9 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 | `/`      | filter issues                                 |
 | `w`      | switch **workspace / All workspaces view**      |
 | `m`      | toggle **mine only**                          |
+| `F`      | choose visible **status types**               |
+| `d`      | show / hide **Done** in the current view      |
+| `C`      | choose a **cycle view**                       |
 | `v`      | group by **workspace / status / project**     |
 | `V`      | filter to a **single project**                |
 | `t`      | cycle **theme**                               |
@@ -241,6 +245,25 @@ inside), with tickets that belong to no project collected at the bottom. Press
 <img src="assets/projects.png" alt="group by project" width="80%">
 </div>
 
+## status & cycle views
+
+The default **Active** view contains only Linear's `unstarted` and `started`
+workflow types (shown as Todo and Started). It intentionally excludes Backlog,
+Triage, Done, Canceled, and Duplicate issues.
+
+Press `F` to choose exactly which status types are visible, including Backlog,
+Triage, Canceled, or any combination. The picker also has **Active** and
+**Everything** presets. Press `d` to add or remove Done without revealing any
+other excluded status; from Active this toggles between Active and
+Active + Done.
+
+Press `C` to choose **All cycles**, **Current**, **Next**, **Previous**,
+**No cycle**, or a specific named cycle. In All workspaces, named cycles are
+scoped and labeled by workspace, so cycles with the same Linear id or name do
+not collide. Status and cycle views combine with mine-only, project, and text
+filters, and are remembered separately for each workspace and the combined
+view.
+
 ## make it yours
 
 every keybind is remappable, vim-style motions included:
@@ -254,6 +277,9 @@ ltui --init-config    # writes ~/.config/ltui/config.json
   "keybinds": {
     "new_ticket": "n",            // any action -> any key
     "switch_workspace": "w",
+    "filter_status": "F",
+    "toggle_done": "d",
+    "pick_cycle": "C",
     "yank": ["y", "ctrl+y"]       // or several keys
   },
   "options": {
@@ -291,8 +317,9 @@ slot it into the right column.
 
 Your profile lives bottom-left — workspace, name, org, and one-click toggles
 for theme and mine-only. Press `,` (or click ` settings`) for the panel: switch
-workspace, flip preferences, or clear the active workspace's cache. From the
-combined view, the same action is labeled **clear all caches**.
+workspace, choose status and cycle views, flip preferences, or clear the active
+workspace's cache. From the combined view, the same action is labeled
+**clear all caches**.
 
 <div align="center">
 <img src="assets/settings.png" alt="settings panel" width="80%">

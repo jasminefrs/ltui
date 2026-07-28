@@ -52,6 +52,7 @@ def aggregate_issue(name: str) -> dict:
         "relations": {"nodes": []},
         "inverseRelations": {"nodes": []},
         "project": {"id": "shared-project", "name": f"{name} Project", "color": "#abcdef"},
+        "cycle": aggregate_cycle(name, "current"),
         "parent": None,
         "state": {
             "id": "shared-state",
@@ -61,6 +62,49 @@ def aggregate_issue(name: str) -> dict:
             "position": 1,
         },
     }
+
+
+def aggregate_cycle(name: str, mode: str, cycle_id: str | None = None) -> dict:
+    number = {"previous": 11, "current": 12, "next": 13}[mode]
+    return {
+        "id": cycle_id or f"shared-{mode}-cycle",
+        "name": f"{name} {mode.title()}",
+        "number": number,
+        "startsAt": f"2026-07-{number:02d}T00:00:00Z",
+        "endsAt": f"2026-07-{number + 6:02d}T00:00:00Z",
+        "isActive": mode == "current",
+        "isFuture": mode == "next",
+        "isPast": mode == "previous",
+        "isPrevious": mode == "previous",
+        "isNext": mode == "next",
+    }
+
+
+def aggregate_cycles(name: str) -> list[dict]:
+    return [
+        aggregate_cycle(name, "previous"),
+        aggregate_cycle(name, "current"),
+        aggregate_cycle(name, "next"),
+    ]
+
+
+def aggregate_status_issues(workspace: str) -> list[dict]:
+    issues = []
+    for index, state_type in enumerate(ltui.KNOWN_STATUS_TYPES, start=1):
+        issue = aggregate_issue(workspace.title())
+        issue["id"] = f"{workspace}-{state_type}"
+        issue["identifier"] = f"{workspace[:1].upper()}-{index}"
+        issue["title"] = f"{workspace} {state_type}"
+        issue["state"] = {
+            "id": f"{workspace}-{state_type}-state",
+            "name": state_type.title(),
+            "color": "#654321",
+            "type": state_type,
+            "position": index,
+        }
+        issue["_workspace"] = workspace
+        issues.append(issue)
+    return issues
 
 
 class FakeResponse:
@@ -95,7 +139,27 @@ class FakeClient:
             return FakeResponse({"data": boot_data(name)})
         if query == ltui.QL_ISSUES:
             return FakeResponse(
-                {"data": {"team": {"issues": {"nodes": []}, "states": {"nodes": []}}}}
+                {
+                    "data": {
+                        "team": {
+                            "issues": {"nodes": []},
+                            "states": {"nodes": []},
+                        }
+                    }
+                }
+            )
+        if query == ltui.QL_CYCLES:
+            return FakeResponse(
+                {
+                    "data": {
+                        "team": {
+                            "cycles": {
+                                "nodes": [],
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                }
             )
         raise AssertionError("unexpected GraphQL query")
 
@@ -112,6 +176,10 @@ class AggregateFakeClient:
         delay_boot: bool = False,
         mutation_gate: asyncio.Event | None = None,
         mutation_started: asyncio.Event | None = None,
+        boot_gate: asyncio.Event | None = None,
+        boot_started: asyncio.Event | None = None,
+        cycles_has_next: bool = False,
+        issue_state_type: str = "unstarted",
     ) -> None:
         self.key = key
         self.calls = calls
@@ -119,6 +187,10 @@ class AggregateFakeClient:
         self.delay_boot = delay_boot
         self.mutation_gate = mutation_gate
         self.mutation_started = mutation_started
+        self.boot_gate = boot_gate
+        self.boot_started = boot_started
+        self.cycles_has_next = cycles_has_next
+        self.issue_state_type = issue_state_type
         self.closed = False
 
     @property
@@ -130,6 +202,10 @@ class AggregateFakeClient:
         variables = json.get("variables") or {}
         self.calls.append((self.key, query, variables))
         if query == ltui.QL_BOOT:
+            if self.boot_started is not None:
+                self.boot_started.set()
+            if self.boot_gate is not None:
+                await self.boot_gate.wait()
             if self.delay_boot:
                 try:
                     await asyncio.Event().wait()
@@ -161,12 +237,29 @@ class AggregateFakeClient:
         if query == ltui.QL_ISSUES:
             issue = aggregate_issue(self.name)
             issue["assignee"]["id"] = "personal-viewer"
+            issue["state"]["type"] = self.issue_state_type
+            issue["state"]["name"] = self.issue_state_type.title()
             return FakeResponse(
                 {
                     "data": {
                         "team": {
                             "issues": {"nodes": [issue]},
                             "states": {"nodes": [issue["state"]]},
+                        }
+                    }
+                }
+            )
+        if query == ltui.QL_CYCLES:
+            return FakeResponse(
+                {
+                    "data": {
+                        "team": {
+                            "cycles": {
+                                "nodes": aggregate_cycles(self.name),
+                                "pageInfo": {
+                                    "hasNextPage": self.cycles_has_next
+                                },
+                            },
                         }
                     }
                 }
@@ -524,6 +617,245 @@ class ProfileStorageTests(unittest.TestCase):
         )
 
 
+class ViewFilterTests(unittest.TestCase):
+    def test_active_is_only_unstarted_and_started(self) -> None:
+        view = ltui.DEFAULT_STATUS_VIEW
+
+        self.assertEqual(view.mode, "include")
+        self.assertEqual(view.types, frozenset({"unstarted", "started"}))
+        self.assertTrue(ltui.status_view_matches(view, "unstarted"))
+        self.assertTrue(ltui.status_view_matches(view, "started"))
+        for state_type in (
+            "triage",
+            "backlog",
+            "completed",
+            "canceled",
+            "duplicate",
+        ):
+            with self.subTest(state_type=state_type):
+                self.assertFalse(ltui.status_view_matches(view, state_type))
+
+    def test_everything_and_everything_without_done_are_future_proof(self) -> None:
+        everything = ltui.StatusView("exclude", frozenset())
+        without_done = ltui.toggle_done_in_status_view(everything)
+
+        self.assertTrue(ltui.status_view_matches(everything, "future-type"))
+        self.assertFalse(ltui.status_view_matches(without_done, "completed"))
+        self.assertTrue(ltui.status_view_matches(without_done, "future-type"))
+        self.assertEqual(
+            ltui.toggle_done_in_status_view(without_done), everything
+        )
+
+    def test_completed_only_done_toggle_falls_back_to_active(self) -> None:
+        completed_only = ltui.StatusView("include", frozenset({"completed"}))
+
+        self.assertEqual(
+            ltui.toggle_done_in_status_view(completed_only),
+            ltui.DEFAULT_STATUS_VIEW,
+        )
+
+    def test_status_view_state_round_trip_and_invalid_fallback(self) -> None:
+        custom = ltui.StatusView(
+            "include", frozenset({"backlog", "canceled"})
+        )
+        encoded = ltui.status_view_to_state(custom)
+
+        self.assertEqual(ltui.status_view_from_state(encoded), custom)
+        self.assertEqual(
+            ltui.status_view_from_state(
+                {"mode": "exclude", "types": ["completed"]}
+            ),
+            ltui.StatusView("exclude", frozenset({"completed"})),
+        )
+        for invalid in (
+            None,
+            {},
+            {"mode": "include", "types": []},
+            {"mode": "unknown", "types": ["started"]},
+            {"mode": "include", "types": [1]},
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    ltui.status_view_from_state(invalid),
+                    ltui.DEFAULT_STATUS_VIEW,
+                )
+
+
+class GroupedHeaderScrollTests(unittest.IsolatedAsyncioTestCase):
+    async def test_returning_to_first_issue_reveals_first_group_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            storage = ltui.StoragePaths(
+                config=root / "config.toml",
+                linear_config=root / "linear.toml",
+                state_root=root / "state",
+                cache_root=root / "cache",
+            )
+            ltui.save_state(storage, "work", {"welcomed": True})
+            app = ltui.LTUI(
+                profile_resolution(),
+                storage,
+                lambda key: FakeClient(key),
+            )
+            async with app.run_test(size=(70, 14)) as pilot:
+                await wait_for_workers(app)
+                issues = []
+                for index in range(30):
+                    issue = aggregate_issue("Work")
+                    issue["id"] = f"issue-{index}"
+                    issue["identifier"] = f"WRK-{index}"
+                    issue["title"] = f"Grouped issue {index}"
+                    issues.append(issue)
+                app._set_issues(
+                    issues,
+                    [issues[0]["state"]],
+                    aggregate_cycles("Work"),
+                    True,
+                )
+                app.render_issues()
+                await pilot.pause()
+                issue_list = app.query_one("#issues", ltui.NavList)
+                self.assertTrue(issue_list.get_option_at_index(0).disabled)
+                self.assertEqual(issue_list.highlighted, 1)
+
+                for _ in range(8):
+                    await pilot.press("j")
+                await pilot.pause()
+                self.assertGreater(issue_list.scroll_y, 0)
+                await pilot.press("g")
+                await pilot.pause()
+                after_first = issue_list.scroll_y
+
+                issue_list.scroll_home(animate=False, immediate=True)
+                for _ in range(8):
+                    await pilot.press("j")
+                await pilot.pause()
+                for _ in range(8):
+                    await pilot.press("k")
+                await pilot.pause()
+                after_cursor_up = issue_list.scroll_y
+
+                self.assertEqual(issue_list.highlighted, 1)
+                issue_list.scroll_to(y=8, animate=False, immediate=True)
+                await pilot.pause()
+                self.assertGreater(issue_list.scroll_y, 0)
+                await pilot.press("g")
+                await pilot.pause()
+                after_first_while_selected = issue_list.scroll_y
+
+                self.assertEqual(
+                    (after_first, after_cursor_up, after_first_while_selected),
+                    (0, 0, 0),
+                )
+
+
+class CycleViewTests(unittest.TestCase):
+    def test_issue_and_cycle_queries_are_split_below_complexity_limit(self) -> None:
+        for field in (
+            "id",
+            "name",
+            "number",
+            "startsAt",
+            "endsAt",
+            "isActive",
+            "isFuture",
+            "isPast",
+            "isPrevious",
+            "isNext",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, ltui.ISSUE_FIELDS)
+                self.assertIn(field, ltui.QL_ISSUES)
+                self.assertIn(field, ltui.QL_CYCLES)
+        self.assertNotIn("cycles(first: 250)", ltui.QL_ISSUES)
+        self.assertIn("cycles(first: 250)", ltui.QL_CYCLES)
+        self.assertIn("pageInfo { hasNextPage }", ltui.QL_CYCLES)
+
+    def test_cycle_view_state_is_discriminated_and_strict(self) -> None:
+        named = ltui.CycleView(
+            "named",
+            workspace="work",
+            team_id="team-1",
+            cycle_id="cycle-1",
+        )
+        self.assertEqual(
+            ltui.cycle_view_from_state(ltui.cycle_view_to_state(named)), named
+        )
+        for mode in ("all", "current", "next", "previous", "none"):
+            view = ltui.CycleView(mode)
+            self.assertEqual(
+                ltui.cycle_view_from_state(ltui.cycle_view_to_state(view)), view
+            )
+        for invalid in (
+            None,
+            {},
+            {"mode": "future"},
+            {"mode": "named", "workspace": "work"},
+            {
+                "mode": "named",
+                "workspace": "",
+                "team_id": "team-1",
+                "cycle_id": "cycle-1",
+            },
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(
+                    ltui.cycle_view_from_state(invalid), ltui.DEFAULT_CYCLE_VIEW
+                )
+
+    def test_cycle_semantic_and_named_matching(self) -> None:
+        active = {
+            "id": "shared-cycle",
+            "isActive": True,
+            "isNext": False,
+            "isPrevious": False,
+        }
+        issue = {"cycle": active}
+
+        self.assertTrue(
+            ltui.cycle_view_matches(ltui.CycleView("current"), issue, "work")
+        )
+        self.assertFalse(
+            ltui.cycle_view_matches(ltui.CycleView("next"), issue, "work")
+        )
+        self.assertFalse(
+            ltui.cycle_view_matches(ltui.CycleView("none"), issue, "work")
+        )
+        self.assertTrue(
+            ltui.cycle_view_matches(ltui.CycleView("none"), {}, "work")
+        )
+        self.assertTrue(
+            ltui.cycle_view_matches(
+                ltui.CycleView(
+                    "named",
+                    workspace="work",
+                    team_id="shared-team",
+                    cycle_id="shared-cycle",
+                ),
+                issue,
+                "work",
+            )
+        )
+        self.assertFalse(
+            ltui.cycle_view_matches(
+                ltui.CycleView(
+                    "named",
+                    workspace="personal",
+                    team_id="shared-team",
+                    cycle_id="shared-cycle",
+                ),
+                issue,
+                "work",
+            )
+        )
+
+    def test_cycle_ids_are_scoped_across_workspaces(self) -> None:
+        self.assertNotEqual(
+            ltui.cycle_key("work", "shared-cycle"),
+            ltui.cycle_key("personal", "shared-cycle"),
+        )
+
+
 class WorkspaceSwitchTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -731,7 +1063,12 @@ class AllWorkspacesTests(unittest.IsolatedAsyncioTestCase):
                 self.storage,
                 profile_name,
                 "team-shared-team",
-                {"issues": [issue], "states": [issue["state"]]},
+                {
+                    "issues": [issue],
+                    "states": [issue["state"]],
+                    "cycles": aggregate_cycles(label),
+                    "cycles_complete": True,
+                },
             )
 
     async def test_all_view_merges_duplicate_ids_with_workspace_badges(self) -> None:
@@ -815,6 +1152,10 @@ class AllWorkspacesTests(unittest.IsolatedAsyncioTestCase):
                 key for key, query, _ in self.calls if query == ltui.QL_ISSUES
             ]
             self.assertEqual(issue_queries, ["work-secret"])
+            cycle_queries = [
+                key for key, query, _ in self.calls if query == ltui.QL_CYCLES
+            ]
+            self.assertEqual(cycle_queries, ["work-secret"])
             self.assertTrue(all(client.closed for client in self.clients))
 
     async def test_details_and_duplicate_projects_route_and_remain_distinct(self) -> None:
@@ -1019,6 +1360,343 @@ class AllWorkspacesTests(unittest.IsolatedAsyncioTestCase):
             )
             gate.set()
             await wait_for_workers(app)
+
+
+class StatusViewInteractionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.storage = ltui.StoragePaths(
+            config=root / "config.toml",
+            linear_config=root / "linear.toml",
+            state_root=root / "state",
+            cache_root=root / "cache",
+        )
+        for profile in ("work", "personal"):
+            ltui.save_state(self.storage, profile, {"welcomed": True})
+        ltui.save_state(
+            self.storage,
+            ltui.ALL_WORKSPACES,
+            {"welcomed": True, "group_by": "workspace"},
+        )
+        base = profile_resolution()
+        self.resolution = ltui.ProfileResolution(
+            base.profiles, ltui.ALL_WORKSPACES, "multi"
+        )
+        self.calls: list[tuple] = []
+        self.clients: list[AggregateFakeClient] = []
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def factory(self, key: str) -> AggregateFakeClient:
+        client = AggregateFakeClient(key, self.calls)
+        self.clients.append(client)
+        return client
+
+    async def test_aggregate_status_views_cover_every_workflow_type(self) -> None:
+        app = ltui.LTUI(self.resolution, self.storage, self.factory)
+        async with app.run_test():
+            await wait_for_workers(app)
+            app._issues = aggregate_status_issues("work") + aggregate_status_issues(
+                "personal"
+            )
+            app._issue_by_id = {
+                app._issue_key(issue): issue for issue in app._issues
+            }
+
+            app.render_issues()
+            self.assertEqual(len(app._opt_index), 4)
+            self.assertEqual(
+                {
+                    issue["state"]["type"]
+                    for issue in app._issues
+                    if app._issue_key(issue) in app._opt_index
+                },
+                {"unstarted", "started"},
+            )
+
+            app.action_toggle_done()
+            self.assertEqual(
+                {
+                    issue["state"]["type"]
+                    for issue in app._issues
+                    if app._issue_key(issue) in app._opt_index
+                },
+                {"unstarted", "started", "completed"},
+            )
+
+            app._set_status_view(ltui.EVERYTHING_STATUS_VIEW)
+            self.assertEqual(len(app._opt_index), 14)
+            app.action_toggle_done()
+            self.assertNotIn(
+                "completed",
+                {
+                    issue["state"]["type"]
+                    for issue in app._issues
+                    if app._issue_key(issue) in app._opt_index
+                },
+            )
+            self.assertIn(
+                "canceled",
+                {
+                    issue["state"]["type"]
+                    for issue in app._issues
+                    if app._issue_key(issue) in app._opt_index
+                },
+            )
+
+            app._set_status_view(
+                ltui.StatusView("include", frozenset({"backlog", "canceled"}))
+            )
+            self.assertEqual(
+                {
+                    issue["state"]["type"]
+                    for issue in app._issues
+                    if app._issue_key(issue) in app._opt_index
+                },
+                {"backlog", "canceled"},
+            )
+
+    async def test_status_picker_and_preferences_are_view_scoped(self) -> None:
+        app = ltui.LTUI(self.resolution, self.storage, self.factory)
+        async with app.run_test() as pilot:
+            await wait_for_workers(app)
+            await pilot.press("F")
+            await pilot.pause()
+            self.assertIsInstance(app.screen, ltui.StatusFilterModal)
+            rows = app.screen.query_one("#status-list", ltui.NavList)
+            displayed = " ".join(
+                str(rows.get_option_at_index(index).prompt)
+                for index in range(rows.option_count)
+            )
+            for label in (
+                "Active",
+                "Everything",
+                "Triage",
+                "Backlog",
+                "Todo",
+                "Started",
+                "Done",
+                "Canceled",
+                "Duplicate",
+            ):
+                self.assertIn(label, displayed)
+
+            app.screen._sel = {"triage", "canceled"}
+            app.screen.action_apply()
+            await pilot.pause()
+            saved_all = ltui.load_state(self.storage, ltui.ALL_WORKSPACES)
+            self.assertEqual(
+                ltui.status_view_from_state(saved_all["status_view"]),
+                ltui.StatusView("include", frozenset({"triage", "canceled"})),
+            )
+            self.assertNotIn("status_view", ltui.load_state(self.storage, "work"))
+
+
+class CycleViewInteractionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.storage = ltui.StoragePaths(
+            config=root / "config.toml",
+            linear_config=root / "linear.toml",
+            state_root=root / "state",
+            cache_root=root / "cache",
+        )
+        for profile in ("work", "personal"):
+            ltui.save_state(self.storage, profile, {"welcomed": True})
+        ltui.save_state(
+            self.storage,
+            ltui.ALL_WORKSPACES,
+            {"welcomed": True, "group_by": "workspace"},
+        )
+        base = profile_resolution()
+        self.resolution = ltui.ProfileResolution(
+            base.profiles, ltui.ALL_WORKSPACES, "multi"
+        )
+        self.calls: list[tuple] = []
+        self.clients: list[AggregateFakeClient] = []
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def factory(self, key: str) -> AggregateFakeClient:
+        client = AggregateFakeClient(key, self.calls)
+        self.clients.append(client)
+        return client
+
+    def seed_legacy_caches(self) -> None:
+        for profile_name, label in (("work", "Work"), ("personal", "Personal")):
+            boot = boot_data(label)
+            boot["teams"]["nodes"][0]["id"] = "shared-team"
+            issue = aggregate_issue(label)
+            ltui.write_cache(self.storage, profile_name, "boot", boot)
+            ltui.write_cache(
+                self.storage,
+                profile_name,
+                "team-shared-team",
+                {"issues": [issue], "states": [issue["state"]]},
+            )
+
+    async def test_cycle_picker_modes_and_duplicate_ids_are_isolated(self) -> None:
+        app = ltui.LTUI(self.resolution, self.storage, self.factory)
+        async with app.run_test() as pilot:
+            await wait_for_workers(app)
+            app.action_pick_cycle()
+            await pilot.pause()
+            picker = app.screen.query_one("#picker-list", ltui.NavList)
+            self.assertEqual(picker.option_count, 11)
+            displayed = " ".join(
+                str(picker.get_option_at_index(index).prompt)
+                for index in range(picker.option_count)
+            )
+            for label in (
+                "All cycles",
+                "Current",
+                "Next",
+                "Previous",
+                "No cycle",
+                "Work Current",
+                "Personal Current",
+            ):
+                self.assertIn(label, displayed)
+            await pilot.press("escape")
+            await pilot.pause()
+
+            app._set_cycle_view(ltui.CycleView("current"))
+            self.assertEqual(len(app._opt_index), 2)
+            app._set_cycle_view(
+                ltui.CycleView(
+                    "named",
+                    workspace="personal",
+                    team_id="shared-team",
+                    cycle_id="shared-current-cycle",
+                )
+            )
+            self.assertEqual(len(app._opt_index), 1)
+            selected = next(
+                issue
+                for issue in app._issues
+                if app._issue_key(issue) in app._opt_index
+            )
+            self.assertEqual(selected["_workspace"], "personal")
+            saved = ltui.load_state(self.storage, ltui.ALL_WORKSPACES)
+            self.assertEqual(
+                ltui.cycle_view_from_state(saved["cycle_view"]), app._cycle_view
+            )
+            self.assertNotIn("cycle_view", ltui.load_state(self.storage, "work"))
+
+    async def test_legacy_cache_without_cycles_remains_usable(self) -> None:
+        self.seed_legacy_caches()
+
+        def delayed_factory(key: str) -> AggregateFakeClient:
+            client = AggregateFakeClient(key, self.calls, delay_boot=True)
+            self.clients.append(client)
+            return client
+
+        app = ltui.LTUI(self.resolution, self.storage, delayed_factory)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertEqual(len(app._issues), 2)
+            self.assertEqual(app._workspace_cycles, {"work": [], "personal": []})
+
+    async def test_stale_named_cycle_resets_only_for_complete_connections(self) -> None:
+        missing = ltui.CycleView(
+            "named",
+            workspace="work",
+            team_id="shared-team",
+            cycle_id="missing-cycle",
+        )
+        state = ltui.load_state(self.storage, ltui.ALL_WORKSPACES)
+        state["cycle_view"] = ltui.cycle_view_to_state(missing)
+        ltui.save_state(self.storage, ltui.ALL_WORKSPACES, state)
+
+        complete = ltui.LTUI(self.resolution, self.storage, self.factory)
+        async with complete.run_test():
+            await wait_for_workers(complete)
+            self.assertEqual(complete._cycle_view, ltui.DEFAULT_CYCLE_VIEW)
+
+        state["cycle_view"] = ltui.cycle_view_to_state(missing)
+        ltui.save_state(self.storage, ltui.ALL_WORKSPACES, state)
+
+        def truncated_factory(key: str) -> AggregateFakeClient:
+            client = AggregateFakeClient(
+                key,
+                self.calls,
+                cycles_has_next=key == "work-secret",
+            )
+            self.clients.append(client)
+            return client
+
+        truncated = ltui.LTUI(self.resolution, self.storage, truncated_factory)
+        async with truncated.run_test():
+            await wait_for_workers(truncated)
+            self.assertEqual(truncated._cycle_view, missing)
+
+    async def test_named_cycle_resets_when_switching_teams(self) -> None:
+        normal = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with normal.run_test():
+            await wait_for_workers(normal)
+            normal._set_cycle_view(
+                ltui.CycleView(
+                    "named",
+                    workspace="work",
+                    team_id="shared-team",
+                    cycle_id="shared-current-cycle",
+                )
+            )
+            normal.load_team(
+                {
+                    "id": "other-team",
+                    "key": "OTH",
+                    "name": "Other",
+                    "color": "#123456",
+                }
+            )
+            await wait_for_workers(normal)
+            self.assertEqual(normal._cycle_view, ltui.DEFAULT_CYCLE_VIEW)
+            saved = ltui.load_state(self.storage, "work")
+            self.assertEqual(
+                ltui.cycle_view_from_state(saved["cycle_view"]),
+                ltui.DEFAULT_CYCLE_VIEW,
+            )
+
+    async def test_filter_changes_during_refresh_apply_to_live_merge(self) -> None:
+        self.seed_legacy_caches()
+        state = ltui.load_state(self.storage, ltui.ALL_WORKSPACES)
+        state["status_view"] = ltui.status_view_to_state(
+            ltui.EVERYTHING_STATUS_VIEW
+        )
+        ltui.save_state(self.storage, ltui.ALL_WORKSPACES, state)
+        gate = asyncio.Event()
+
+        def gated_factory(key: str) -> AggregateFakeClient:
+            client = AggregateFakeClient(
+                key,
+                self.calls,
+                boot_gate=gate,
+                issue_state_type="completed",
+            )
+            self.clients.append(client)
+            return client
+
+        app = ltui.LTUI(self.resolution, self.storage, gated_factory)
+        async with app.run_test() as pilot:
+            for _ in range(20):
+                await pilot.pause(0.02)
+                if sum(query == ltui.QL_BOOT for _, query, _ in self.calls) == 2:
+                    break
+            app._set_status_view(ltui.DEFAULT_STATUS_VIEW)
+            app._set_cycle_view(ltui.CycleView("current"))
+            gate.set()
+            await wait_for_workers(app)
+            self.assertEqual(app._status_view, ltui.DEFAULT_STATUS_VIEW)
+            self.assertEqual(app._cycle_view, ltui.CycleView("current"))
+            self.assertEqual(
+                {issue["state"]["type"] for issue in app._issues}, {"completed"}
+            )
+            self.assertEqual(app._opt_index, {})
 
 
 if __name__ == "__main__":

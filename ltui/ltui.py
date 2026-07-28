@@ -231,9 +231,186 @@ TYPE_RANK = {
     "duplicate": 6,
 }
 
+KNOWN_STATUS_TYPES = (
+    "triage",
+    "backlog",
+    "unstarted",
+    "started",
+    "completed",
+    "canceled",
+    "duplicate",
+)
+STATUS_TYPE_LABELS = {
+    "triage": "Triage",
+    "backlog": "Backlog",
+    "unstarted": "Todo",
+    "started": "Started",
+    "completed": "Done",
+    "canceled": "Canceled",
+    "duplicate": "Duplicate",
+}
+ACTIVE_STATUS_TYPES = frozenset(("unstarted", "started"))
+
+
+@dataclass(frozen=True)
+class StatusView:
+    mode: str
+    types: frozenset[str]
+
+
+DEFAULT_STATUS_VIEW = StatusView("include", ACTIVE_STATUS_TYPES)
+EVERYTHING_STATUS_VIEW = StatusView("exclude", frozenset())
+
+
+def status_view_matches(view: StatusView, state_type: str) -> bool:
+    """Return whether a Linear workflow type is visible in ``view``."""
+    if view.mode == "exclude":
+        return state_type not in view.types
+    return state_type in view.types
+
+
+def status_view_from_state(value: object) -> StatusView:
+    """Decode persisted status-view data, falling back safely to Active."""
+    if not isinstance(value, dict):
+        return DEFAULT_STATUS_VIEW
+    mode = value.get("mode")
+    raw_types = value.get("types")
+    if mode not in ("include", "exclude") or not isinstance(raw_types, list):
+        return DEFAULT_STATUS_VIEW
+    if not all(isinstance(item, str) and item for item in raw_types):
+        return DEFAULT_STATUS_VIEW
+    types = frozenset(raw_types)
+    if mode == "include" and not types:
+        return DEFAULT_STATUS_VIEW
+    return StatusView(mode, types)
+
+
+def status_view_to_state(view: StatusView) -> dict:
+    return {"mode": view.mode, "types": sorted(view.types)}
+
+
+def toggle_done_in_status_view(view: StatusView) -> StatusView:
+    """Toggle completed issues without changing any other type's visibility."""
+    if status_view_matches(view, "completed"):
+        if view.mode == "exclude":
+            return StatusView("exclude", view.types | {"completed"})
+        remaining = view.types - {"completed"}
+        return StatusView("include", remaining) if remaining else DEFAULT_STATUS_VIEW
+    if view.mode == "exclude":
+        return StatusView("exclude", view.types - {"completed"})
+    return StatusView("include", view.types | {"completed"})
+
+
+def status_view_label(view: StatusView) -> str:
+    if view == DEFAULT_STATUS_VIEW:
+        return "Active"
+    if view == EVERYTHING_STATUS_VIEW:
+        return "Everything"
+    if view == StatusView("include", ACTIVE_STATUS_TYPES | {"completed"}):
+        return "Active + Done"
+    if view.mode == "exclude":
+        hidden = ", ".join(
+            STATUS_TYPE_LABELS.get(item, item) for item in sorted(view.types)
+        )
+        return f"Everything − {hidden}"
+    labels = [
+        STATUS_TYPE_LABELS.get(item, item)
+        for item in KNOWN_STATUS_TYPES
+        if item in view.types
+    ]
+    return ", ".join(labels) if labels else "Active"
+
+
+@dataclass(frozen=True)
+class CycleView:
+    mode: str
+    workspace: str | None = None
+    team_id: str | None = None
+    cycle_id: str | None = None
+
+
+DEFAULT_CYCLE_VIEW = CycleView("all")
+CYCLE_SEMANTIC_MODES = frozenset(("all", "current", "next", "previous", "none"))
+
+
+def cycle_view_from_state(value: object) -> CycleView:
+    """Decode a persisted cycle selector without overloading ids as modes."""
+    if not isinstance(value, dict):
+        return DEFAULT_CYCLE_VIEW
+    mode = value.get("mode")
+    if mode in CYCLE_SEMANTIC_MODES:
+        return CycleView(mode)
+    if mode != "named":
+        return DEFAULT_CYCLE_VIEW
+    identity = (value.get("workspace"), value.get("team_id"), value.get("cycle_id"))
+    if not all(isinstance(item, str) and item for item in identity):
+        return DEFAULT_CYCLE_VIEW
+    return CycleView("named", *identity)
+
+
+def cycle_view_to_state(view: CycleView) -> dict:
+    data = {"mode": view.mode}
+    if view.mode == "named":
+        data.update(
+            workspace=view.workspace,
+            team_id=view.team_id,
+            cycle_id=view.cycle_id,
+        )
+    return data
+
+
+def cycle_key(workspace: str, cycle_id: str) -> str:
+    return scoped_id(workspace, cycle_id)
+
+
+def cycle_name(cycle: dict) -> str:
+    return cycle.get("name") or f"Cycle {cycle.get('number', '?')}"
+
+
+def cycle_sort_key(cycle: dict) -> tuple:
+    if cycle.get("isActive"):
+        rank = 0
+    elif cycle.get("isNext"):
+        rank = 1
+    elif cycle.get("isFuture"):
+        rank = 2
+    elif cycle.get("isPrevious"):
+        rank = 3
+    elif cycle.get("isPast"):
+        rank = 4
+    else:
+        rank = 5
+    return rank, cycle.get("startsAt") or "", cycle.get("number") or 0
+
+
+def cycle_view_matches(view: CycleView, issue: dict, workspace: str) -> bool:
+    cycle = issue.get("cycle")
+    if view.mode == "all":
+        return True
+    if view.mode == "none":
+        return cycle is None
+    if cycle is None:
+        return False
+    if view.mode == "current":
+        return bool(cycle.get("isActive"))
+    if view.mode == "next":
+        return bool(cycle.get("isNext"))
+    if view.mode == "previous":
+        return bool(cycle.get("isPrevious"))
+    return bool(
+        view.mode == "named"
+        and view.workspace == workspace
+        and view.cycle_id == cycle.get("id")
+    )
+
 PRIORITIES = [(1, "Urgent"), (2, "High"), (3, "Medium"), (4, "Low"), (0, "No priority")]
 
 # ── graphql ───────────────────────────────────────────────────────────────
+CYCLE_FIELDS = """
+        id name number startsAt endsAt
+        isActive isFuture isPast isPrevious isNext
+"""
+
 ISSUE_FIELDS = """
         id identifier title description url priority branchName
         updatedAt createdAt
@@ -243,6 +420,9 @@ ISSUE_FIELDS = """
         relations(first: 6) { nodes { type relatedIssue { identifier } } }
         inverseRelations(first: 6) { nodes { type issue { identifier } } }
         project { id name color }
+        cycle {
+""" + CYCLE_FIELDS + """
+        }
         parent { identifier }
 """
 
@@ -260,6 +440,16 @@ query($teamId: String!) {{
       nodes {{ {ISSUE_FIELDS} }}
     }}
     states {{ nodes {{ id name color type position }} }}
+  }}
+}}"""
+
+QL_CYCLES = f"""
+query($teamId: String!) {{
+  team(id: $teamId) {{
+    cycles(first: 250) {{
+      nodes {{ {CYCLE_FIELDS} }}
+      pageInfo {{ hasNextPage }}
+    }}
   }}
 }}"""
 
@@ -373,9 +563,12 @@ DEFAULT_KEYBINDS = {
     "change_status": (["s"], "status"),
     "add_comment": (["c"], "comment"),
     "filter": (["slash"], "filter"),
+    "filter_status": (["F"], None),
+    "toggle_done": (["d"], None),
     "toggle_mine": (["m"], "mine"),
     "toggle_group": (["v"], "group"),
     "pick_project": (["V"], None),
+    "pick_cycle": (["C"], None),
     "cycle_theme": (["t"], "theme"),
     "open_settings": (["comma"], None),
     "switch_workspace": (["w"], None),
@@ -432,9 +625,12 @@ CONFIG_TEMPLATE = """{
     "change_status": "s",
     "add_comment": "c",
     "filter": "slash",
+    "filter_status": "F",
+    "toggle_done": "d",
     "toggle_mine": "m",
     "toggle_group": "v",
     "pick_project": "V",
+    "pick_cycle": "C",
     "cycle_theme": "t",
     "open_settings": "comma",
     "switch_workspace": "w",
@@ -501,6 +697,8 @@ class WorkspaceSnapshot:
     team: dict
     issues: list[dict]
     states: list[dict]
+    cycles: list[dict]
+    cycles_complete: bool
 
 
 def _validate_component(value: str, kind: str) -> str:
@@ -996,6 +1194,27 @@ class NavList(OptionList):
         Binding("ctrl+b", "page_up", show=False),
     ]
 
+    def _reveal_leading_rows(self) -> None:
+        """Keep disabled headers above the first selectable row visible."""
+        highlighted = self.highlighted
+        if highlighted is None:
+            return
+        if all(
+            self.get_option_at_index(index).disabled
+            for index in range(highlighted)
+        ):
+            self.scroll_home(animate=False, force=True, immediate=True)
+
+    def watch_highlighted(self, highlighted: int | None) -> None:
+        super().watch_highlighted(highlighted)
+        self._reveal_leading_rows()
+
+    def action_first(self) -> None:
+        super().action_first()
+        # The reactive watcher does not run when the first item was already
+        # highlighted (for example after mouse-wheel scrolling).
+        self._reveal_leading_rows()
+
     def _snap_to_enabled(self, direction: int) -> None:
         """Page motions can land on a disabled header; nudge to a real row."""
         if not self.option_count:
@@ -1418,6 +1637,106 @@ class LabelsModal(ModalScreen):
         self.dismiss(None)
 
 
+class StatusFilterModal(ModalScreen):
+    """Multi-select workflow-type view with Active and Everything presets."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", show=False),
+        Binding("ctrl+s", "apply", show=False),
+    ]
+
+    def __init__(self, view: StatusView) -> None:
+        super().__init__()
+        self._original = view
+        self._sel = {
+            state_type
+            for state_type in KNOWN_STATUS_TYPES
+            if status_view_matches(view, state_type)
+        }
+        self._initial_sel = set(self._sel)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="status-box"):
+            yield Static("status view", id="status-title")
+            yield NavList(id="status-list")
+            with Horizontal(id="status-actions"):
+                yield Static(
+                    f"[{C_DIM}]enter toggles · ctrl+s applies · esc cancels[/]",
+                    id="status-hint",
+                )
+                yield Button("cancel", id="status-cancel")
+                yield Button("\uf00c apply", variant="primary", id="status-apply")
+
+    def on_mount(self) -> None:
+        pop_in(self.query_one("#status-box"))
+        self._build()
+        self.query_one("#status-list").focus()
+
+    def _build(self) -> None:
+        ol = self.query_one("#status-list", NavList)
+        previous = ol.highlighted
+        ol.clear_options()
+        options = []
+        for option_id, label, selected in (
+            ("preset:active", "Active", self._sel == set(ACTIVE_STATUS_TYPES)),
+            ("preset:all", "Everything", self._sel == set(KNOWN_STATUS_TYPES)),
+        ):
+            row = Text("\uf0b0 ", style=C_BLUE)
+            row.append(label, style=C_TEXT)
+            if selected:
+                row.append("  \uf00c", style=C_GREEN)
+            options.append(Option(row, id=option_id))
+        options.append(Option(Text(" "), disabled=True))
+        for state_type in KNOWN_STATUS_TYPES:
+            selected = state_type in self._sel
+            row = Text("\uf00c " if selected else "   ", style=C_GREEN)
+            row.append(
+                STATUS_TYPE_LABELS[state_type],
+                style=C_TEXT if selected else C_SUB,
+            )
+            options.append(Option(row, id=f"type:{state_type}"))
+        ol.add_options(options)
+        ol.highlighted = previous if previous is not None else 0
+
+    @on(OptionList.OptionSelected, "#status-list")
+    def _toggle(self, event: OptionList.OptionSelected) -> None:
+        option_id = event.option.id or ""
+        if option_id == "preset:active":
+            self._sel = set(ACTIVE_STATUS_TYPES)
+        elif option_id == "preset:all":
+            self._sel = set(KNOWN_STATUS_TYPES)
+        elif option_id.startswith("type:"):
+            state_type = option_id.removeprefix("type:")
+            if state_type in self._sel:
+                self._sel.remove(state_type)
+            else:
+                self._sel.add(state_type)
+        self._build()
+
+    @on(Button.Pressed, "#status-apply")
+    def _apply_button(self) -> None:
+        self.action_apply()
+
+    @on(Button.Pressed, "#status-cancel")
+    def _cancel_button(self) -> None:
+        self.dismiss(None)
+
+    def action_apply(self) -> None:
+        if not self._sel:
+            self.app.notify("select at least one status type", severity="warning")
+            return
+        if self._sel == self._initial_sel:
+            view = self._original
+        elif self._sel == set(KNOWN_STATUS_TYPES):
+            view = EVERYTHING_STATUS_VIEW
+        else:
+            view = StatusView("include", frozenset(self._sel))
+        self.dismiss(view)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class ProjectNameModal(ModalScreen):
     """One-field prompt for a new project name."""
 
@@ -1499,6 +1818,18 @@ class SettingsModal(ModalScreen):
             row.append("◆ ", style=C_BLUE)
             row.append(f"workspace  {label}", style=C_TEXT)
             opts.append(Option(row, id="workspace:switch"))
+        status_view = getattr(app, "_status_view", DEFAULT_STATUS_VIEW)
+        row = Text("   ")
+        row.append("\uf0b0 ", style=C_BLUE)
+        row.append(
+            f"status view  {status_view_label(status_view)}", style=C_TEXT
+        )
+        opts.append(Option(row, id="view:status"))
+        cycle_label = app._cycle_view_label()
+        row = Text("   ")
+        row.append("\uf021 ", style=C_MAUVE)
+        row.append(f"cycle view  {cycle_label}", style=C_TEXT)
+        opts.append(Option(row, id="view:cycle"))
         mine = getattr(app, "_mine", False)
         row = Text("   ")
         row.append("● " if mine else "○ ", style=C_GREEN if mine else C_DIM)
@@ -1518,6 +1849,14 @@ class SettingsModal(ModalScreen):
         if oid == "workspace:switch":
             self.dismiss(None)
             app.call_later(app.action_switch_workspace)
+            return
+        elif oid == "view:status":
+            self.dismiss(None)
+            app.call_later(app.action_filter_status)
+            return
+        elif oid == "view:cycle":
+            self.dismiss(None)
+            app.call_later(app.action_pick_cycle)
             return
         elif oid == "pref:mine":
             app.action_toggle_mine()
@@ -1564,6 +1903,9 @@ class HelpModal(ModalScreen):
         ]),
         ("view", [
             ("/", "filter issues"),
+            ("F", "choose visible status types"),
+            ("d", "toggle Done issues"),
+            ("C", "choose a cycle view"),
             ("w", "switch workspace / All view"),
             ("m", "toggle mine only"),
             ("v", "group by workspace / status / project"),
@@ -1764,6 +2106,17 @@ class LTUI(App):
     #labels-hint {{ width: 1fr; padding: 1 1; }}
     #labels-actions Button {{ margin: 0 0 0 1; min-width: 9; }}
 
+    StatusFilterModal {{ align: center middle; background: $ltui-overlay; }}
+    #status-box {{
+        width: 48; height: auto; max-height: 90%;
+        background: $ltui-modal-bg; border: round $ltui-border-focus; padding: 1 1;
+    }}
+    #status-title {{ padding: 0 1 1 1; color: {C_SUB}; text-style: bold; }}
+    #status-list {{ height: auto; max-height: 18; }}
+    #status-actions {{ height: 3; margin: 1 0 0 0; }}
+    #status-hint {{ width: 1fr; padding: 1 1; }}
+    #status-actions Button {{ margin: 0 0 0 1; min-width: 9; }}
+
     ProjectNameModal {{ align: center middle; background: $ltui-overlay; }}
     #projname-box {{
         width: 52; height: auto;
@@ -1827,7 +2180,7 @@ class LTUI(App):
         background: $ltui-modal-bg; border: round $ltui-border-focus; padding: 1 1;
     }}
     #settings-profile {{ padding: 0 1 1 1; }}
-    #settings-list {{ height: auto; max-height: 16; }}
+    #settings-list {{ height: auto; max-height: 20; }}
     #settings-foot {{ padding: 1 1 0 1; }}
 
     HelpModal {{ align: center middle; background: $ltui-overlay; }}
@@ -1869,10 +2222,14 @@ class LTUI(App):
         self._teams: list[dict] = []
         self._issues: list[dict] = []
         self._states: list[dict] = []
+        self._cycles: list[dict] = []
+        self._cycles_complete = False
         self._members: dict[str, list] = {}
         self._team_labels: dict[str, list] = {}
         self._team_projects: dict[str, list] = {}
         self._workspace_states: dict[str, list[dict]] = {}
+        self._workspace_cycles: dict[str, list[dict]] = {}
+        self._workspace_cycles_complete: dict[str, bool] = {}
         self._workspace_viewers: dict[str, dict] = {}
         self._workspace_teams: dict[str, dict] = {}
         self._workspace_snapshots: dict[str, WorkspaceSnapshot] = {}
@@ -1884,6 +2241,8 @@ class LTUI(App):
         self._org: str | None = None
         self._mine = False
         self._group_by = "status"
+        self._status_view = DEFAULT_STATUS_VIEW
+        self._cycle_view = DEFAULT_CYCLE_VIEW
         self._filter = ""
         self._project_filter: str | None = None  # project id, "" = no-project
         self._detail_issue: dict | None = None
@@ -1936,6 +2295,67 @@ class LTUI(App):
             return self._workspace_states.get(self._issue_workspace(issue), [])
         return self._states
 
+    def _available_cycles(self) -> list[tuple[str, dict, dict]]:
+        available = []
+        if self._is_all_workspaces:
+            for profile in self._profile_resolution.profiles:
+                team = self._workspace_teams.get(profile.name)
+                if team is None:
+                    continue
+                for cycle in sorted(
+                    self._workspace_cycles.get(profile.name, []),
+                    key=cycle_sort_key,
+                ):
+                    available.append((profile.name, team, cycle))
+            return available
+        if self._team is None:
+            return available
+        return [
+            (self.active_workspace, self._team, cycle)
+            for cycle in sorted(self._cycles, key=cycle_sort_key)
+        ]
+
+    def _cycle_view_label(self) -> str:
+        labels = {
+            "all": "All cycles",
+            "current": "Current",
+            "next": "Next",
+            "previous": "Previous",
+            "none": "No cycle",
+        }
+        if self._cycle_view.mode != "named":
+            return labels.get(self._cycle_view.mode, "All cycles")
+        for workspace, _team, cycle in self._available_cycles():
+            if (
+                workspace == self._cycle_view.workspace
+                and cycle.get("id") == self._cycle_view.cycle_id
+            ):
+                name = cycle_name(cycle)
+                if self._is_all_workspaces:
+                    return f"{self._workspace_label(workspace)} · {name}"
+                return name
+        return "Selected cycle"
+
+    def _validate_named_cycle_for_team(
+        self,
+        workspace: str,
+        team_id: str,
+        cycles: list[dict],
+        cycles_complete: bool,
+    ) -> bool:
+        view = self._cycle_view
+        if view.mode != "named":
+            return False
+        wrong_team = view.workspace != workspace or view.team_id != team_id
+        missing_from_complete = cycles_complete and not any(
+            cycle.get("id") == view.cycle_id for cycle in cycles
+        )
+        if not wrong_team and not missing_from_complete:
+            return False
+        self._cycle_view = DEFAULT_CYCLE_VIEW
+        self._save_state()
+        return True
+
     def _load_profile_state(self) -> dict:
         if self._active_profile is None:
             return {}
@@ -1966,6 +2386,8 @@ class LTUI(App):
     def _apply_profile_preferences(self) -> None:
         state = self._load_profile_state()
         self._mine = bool(state.get("mine", False))
+        self._status_view = status_view_from_state(state.get("status_view"))
+        self._cycle_view = cycle_view_from_state(state.get("cycle_view"))
         group_by = state.get("group_by", "status")
         allowed_groups = (
             ("workspace", "status", "project")
@@ -2255,6 +2677,8 @@ class LTUI(App):
             team,
             team_cache.get("issues", []),
             team_cache.get("states", []),
+            team_cache.get("cycles", []),
+            bool(team_cache.get("cycles_complete", False)),
         )
 
     async def _fetch_workspace_snapshot(
@@ -2267,9 +2691,15 @@ class LTUI(App):
                 team = self._workspace_team(profile.name, boot)
                 if team is None:
                     raise RuntimeError("no teams found")
-                data = await self._gql_client(
-                    client, QL_ISSUES, {"teamId": team["id"]}
+                data, cycle_data = await asyncio.gather(
+                    self._gql_client(
+                        client, QL_ISSUES, {"teamId": team["id"]}
+                    ),
+                    self._gql_client(
+                        client, QL_CYCLES, {"teamId": team["id"]}
+                    ),
                 )
+                cycles = cycle_data["team"]["cycles"]
                 return WorkspaceSnapshot(
                     profile.name,
                     profile.label,
@@ -2277,6 +2707,8 @@ class LTUI(App):
                     team,
                     data["team"]["issues"]["nodes"],
                     data["team"]["states"]["nodes"],
+                    cycles["nodes"],
+                    not cycles["pageInfo"]["hasNextPage"],
                 )
             finally:
                 await client.aclose()
@@ -2300,6 +2732,7 @@ class LTUI(App):
         if not self._aggregate_is_current(generation):
             return
         merged = dict(cached)
+        refreshed: set[str] = set()
         for profile, result in zip(profiles, results):
             if isinstance(result, BaseException):
                 self.notify(
@@ -2315,11 +2748,27 @@ class LTUI(App):
                 self._storage,
                 profile.name,
                 f"team-{result.team['id']}",
-                {"issues": result.issues, "states": result.states},
+                {
+                    "issues": result.issues,
+                    "states": result.states,
+                    "cycles": result.cycles,
+                    "cycles_complete": result.cycles_complete,
+                },
             )
             merged[profile.name] = result
+            refreshed.add(profile.name)
         if not self._aggregate_is_current(generation):
             return
+        view = self._cycle_view
+        if view.mode == "named" and view.workspace in refreshed:
+            snapshot = merged.get(view.workspace)
+            if snapshot is not None:
+                self._validate_named_cycle_for_team(
+                    view.workspace,
+                    snapshot.team["id"],
+                    snapshot.cycles,
+                    snapshot.cycles_complete,
+                )
         self._render_all_workspaces(merged)
         self.query_one("#issues", NavList).loading = False
 
@@ -2335,6 +2784,12 @@ class LTUI(App):
         self._workspace_states = {
             name: snapshot.states for name, snapshot in snapshots.items()
         }
+        self._workspace_cycles = {
+            name: snapshot.cycles for name, snapshot in snapshots.items()
+        }
+        self._workspace_cycles_complete = {
+            name: snapshot.cycles_complete for name, snapshot in snapshots.items()
+        }
         self._workspace_viewers = {
             name: snapshot.boot["viewer"] for name, snapshot in snapshots.items()
         }
@@ -2342,6 +2797,8 @@ class LTUI(App):
         self._teams = []
         self._issues = []
         self._states = []
+        self._cycles = []
+        self._cycles_complete = False
         for name, snapshot in snapshots.items():
             team = dict(snapshot.team)
             team["_workspace"] = name
@@ -2463,6 +2920,8 @@ class LTUI(App):
         data["mine"] = self._mine
         data["theme"] = self.theme
         data["group_by"] = self._group_by
+        data["status_view"] = status_view_to_state(self._status_view)
+        data["cycle_view"] = cycle_view_to_state(self._cycle_view)
         save_state(self._storage, self.active_workspace, data)
 
     @staticmethod
@@ -2481,11 +2940,18 @@ class LTUI(App):
                 if self._issue_workspace(candidate) == workspace
             ]
             states = self._workspace_states.get(workspace, [])
+            cycles = self._workspace_cycles.get(workspace, [])
+            cycles_complete = self._workspace_cycles_complete.get(workspace, False)
             write_cache(
                 self._storage,
                 workspace,
                 f"team-{team['id']}",
-                {"issues": issues, "states": states},
+                {
+                    "issues": issues,
+                    "states": states,
+                    "cycles": cycles,
+                    "cycles_complete": cycles_complete,
+                },
             )
             snapshot = self._workspace_snapshots.get(workspace)
             if snapshot is not None:
@@ -2496,23 +2962,41 @@ class LTUI(App):
                     snapshot.team,
                     issues,
                     states,
+                    cycles,
+                    cycles_complete,
                 )
         elif self._team is not None:
             write_cache(
                 self._storage,
                 self.active_workspace,
                 f"team-{self._team['id']}",
-                {"issues": self._issues, "states": self._states},
+                {
+                    "issues": self._issues,
+                    "states": self._states,
+                    "cycles": self._cycles,
+                    "cycles_complete": self._cycles_complete,
+                },
             )
 
-    def _set_issues(self, issues: list[dict], states: list[dict]) -> None:
+    def _set_issues(
+        self,
+        issues: list[dict],
+        states: list[dict],
+        cycles: list[dict] | None = None,
+        cycles_complete: bool = False,
+    ) -> None:
         self._issues = issues
         self._states = states
+        self._cycles = cycles or []
+        self._cycles_complete = cycles_complete
         self._issue_by_id = {self._issue_key(issue): issue for issue in issues}
 
     @work(exclusive=True, group="issues")
     async def load_team(self, team: dict) -> None:
         self._team = team
+        self._validate_named_cycle_for_team(
+            self.active_workspace, team["id"], [], False
+        )
         centre = self.query_one("#centre")
         centre.border_title = f" {team['key']} · {team['name']} "
         centre.border_subtitle = ""
@@ -2528,7 +3012,12 @@ class LTUI(App):
             allow_legacy=allow_legacy,
         )
         if cached:
-            self._set_issues(cached["issues"], cached["states"])
+            self._set_issues(
+                cached["issues"],
+                cached["states"],
+                cached.get("cycles", []),
+                bool(cached.get("cycles_complete", False)),
+            )
             self.render_issues()
             centre.border_subtitle = f" {len(self._issues)} · ↻ refreshing "
             self._refreshing = True
@@ -2536,7 +3025,10 @@ class LTUI(App):
             issues_list.loading = True
         self._save_state()
         try:
-            data = await self.gql(QL_ISSUES, {"teamId": team["id"]})
+            data, cycle_data = await asyncio.gather(
+                self.gql(QL_ISSUES, {"teamId": team["id"]}),
+                self.gql(QL_CYCLES, {"teamId": team["id"]}),
+            )
         except Exception as e:
             issues_list.loading = False
             self._refreshing = False
@@ -2548,8 +3040,19 @@ class LTUI(App):
         if self._team is None or self._team["id"] != team["id"]:
             self._refreshing = False
             return  # user switched teams while refreshing
+        cycles = cycle_data["team"]["cycles"]
+        cycles_complete = not cycles["pageInfo"]["hasNextPage"]
         self._set_issues(
-            data["team"]["issues"]["nodes"], data["team"]["states"]["nodes"]
+            data["team"]["issues"]["nodes"],
+            data["team"]["states"]["nodes"],
+            cycles["nodes"],
+            cycles_complete,
+        )
+        self._validate_named_cycle_for_team(
+            self.active_workspace,
+            team["id"],
+            self._cycles,
+            cycles_complete,
         )
         issues_list.loading = False
         self._refreshing = False
@@ -2557,7 +3060,12 @@ class LTUI(App):
             self._storage,
             self.active_workspace,
             f"team-{team['id']}",
-            {"issues": self._issues, "states": self._states},
+            {
+                "issues": self._issues,
+                "states": self._states,
+                "cycles": self._cycles,
+                "cycles_complete": self._cycles_complete,
+            },
         )
         self.render_issues()
         # a cold load covers the list with a loading overlay, which kicks
@@ -2776,7 +3284,16 @@ class LTUI(App):
 
         width = max(ol.content_size.width - 2, 40)
         flt = self._filter.lower()
-        issues = self._issues
+        issues = [
+            issue
+            for issue in self._issues
+            if status_view_matches(
+                self._status_view, issue.get("state", {}).get("type", "")
+            )
+            and cycle_view_matches(
+                self._cycle_view, issue, self._issue_workspace(issue)
+            )
+        ]
         def viewer_id(issue: dict) -> str | None:
             if self._is_all_workspaces:
                 viewer = self._workspace_viewers.get(self._issue_workspace(issue), {})
@@ -2809,6 +3326,8 @@ class LTUI(App):
                     + ((i.get("assignee") or {}).get("displayName") or "")
                     + " "
                     + self._workspace_label(self._issue_workspace(i))
+                    + " "
+                    + (cycle_name(i["cycle"]) if i.get("cycle") else "")
                 ).lower()
             ]
 
@@ -2902,6 +3421,12 @@ class LTUI(App):
 
         # a group's first issue sits right after its header row
         self._group_starts = [h + 1 for h in self._header_indices]
+        status_tag = f" \uf0b0 {status_view_label(self._status_view)} \u00b7"
+        cycle_tag = (
+            f" \uf021 {self._cycle_view_label()} \u00b7"
+            if self._cycle_view.mode != "all"
+            else ""
+        )
         mine_tag = " \uf007 mine \u00b7" if self._mine else ""
         proj_tag = ""
         if self._project_filter is not None:
@@ -2912,7 +3437,7 @@ class LTUI(App):
             ) or "no project"
             proj_tag = f" \uf07b {pname} \u00b7"
         self.query_one("#centre").border_subtitle = (
-            f"{mine_tag}{proj_tag} {len(issues)} issues "
+            f"{status_tag}{cycle_tag}{mine_tag}{proj_tag} {len(issues)} issues "
         )
         if keep and keep in self._opt_index:
             ol.highlighted = self._opt_index[keep]
@@ -3055,6 +3580,11 @@ class LTUI(App):
             m.append("   ")
             m.append("\uf07b ", style=project.get("color") or C_DIM)
             m.append(project["name"], style=C_SUB)
+        cycle = issue.get("cycle")
+        if cycle:
+            m.append("   ")
+            m.append("\uf021 ", style=C_BLUE)
+            m.append(cycle_name(cycle), style=C_SUB)
         labels = issue["labels"]["nodes"]
         if labels:
             m.append("\n")
@@ -3223,10 +3753,14 @@ class LTUI(App):
         self._teams = []
         self._issues = []
         self._states = []
+        self._cycles = []
+        self._cycles_complete = False
         self._members = {}
         self._team_labels = {}
         self._team_projects = {}
         self._workspace_states = {}
+        self._workspace_cycles = {}
+        self._workspace_cycles_complete = {}
         self._workspace_viewers = {}
         self._workspace_teams = {}
         self._workspace_snapshots = {}
@@ -3235,6 +3769,8 @@ class LTUI(App):
         self._viewer_name = None
         self._boot_data = None
         self._org = None
+        self._status_view = DEFAULT_STATUS_VIEW
+        self._cycle_view = DEFAULT_CYCLE_VIEW
         self._filter = ""
         self._project_filter = None
         self._detail_issue = None
@@ -3436,6 +3972,65 @@ class LTUI(App):
 
         self.push_screen(PickerModal("filter by project", opts), done)
 
+    def _set_cycle_view(self, view: CycleView) -> None:
+        self._cycle_view = view
+        self._save_state()
+        self.render_issues()
+
+    def action_pick_cycle(self) -> None:
+        options = []
+        named_views: dict[str, CycleView] = {}
+
+        for mode, label in (
+            ("all", "All cycles"),
+            ("current", "Current"),
+            ("next", "Next"),
+            ("previous", "Previous"),
+            ("none", "No cycle"),
+        ):
+            view = CycleView(mode)
+            count = sum(
+                cycle_view_matches(view, issue, self._issue_workspace(issue))
+                for issue in self._issues
+            )
+            row = Text("\uf021 ", style=C_BLUE)
+            row.append(label, style=C_TEXT)
+            row.append(f"  {count}", style=C_DIM)
+            if self._cycle_view == view:
+                row.append("  \uf00c", style=C_GREEN)
+            options.append(Option(row, id=f"mode:{mode}"))
+
+        for workspace, team, cycle in self._available_cycles():
+            key = cycle_key(workspace, cycle["id"])
+            view = CycleView("named", workspace, team["id"], cycle["id"])
+            named_views[key] = view
+            count = sum(
+                cycle_view_matches(view, issue, self._issue_workspace(issue))
+                for issue in self._issues
+            )
+            row = Text("\uf021 ", style=C_MAUVE)
+            if self._is_all_workspaces:
+                row.append(f"{self._workspace_label(workspace)} · ", style=C_BLUE)
+            row.append(cycle_name(cycle), style=C_TEXT)
+            row.append(f"  {count}", style=C_DIM)
+            if self._cycle_view == view:
+                row.append("  \uf00c", style=C_GREEN)
+            options.append(Option(row, id=f"named:{key}"))
+
+        def selected(choice: str | None) -> None:
+            if choice is None:
+                return
+            if choice.startswith("mode:"):
+                view = CycleView(choice.removeprefix("mode:"))
+            else:
+                view = named_views.get(choice.removeprefix("named:"))
+                if view is None:
+                    return
+            self._set_cycle_view(view)
+            self.notify(f"\uf021 cycle view → {self._cycle_view_label()}")
+
+        self.push_screen(PickerModal("cycle view", options), selected)
+
     def action_next_group(self) -> None:
         self._jump_group(forward=True)
 
@@ -3497,6 +4092,24 @@ class LTUI(App):
         self._save_state()
         self._update_profile()
         self.render_issues()
+
+    def _set_status_view(self, view: StatusView) -> None:
+        self._status_view = view
+        self._save_state()
+        self.render_issues()
+
+    def action_filter_status(self) -> None:
+        def selected(view: StatusView | None) -> None:
+            if view is not None:
+                self._set_status_view(view)
+                self.notify(f"\uf0b0 status view → {status_view_label(view)}")
+
+        self.push_screen(StatusFilterModal(self._status_view), selected)
+
+    def action_toggle_done(self) -> None:
+        self._set_status_view(toggle_done_in_status_view(self._status_view))
+        visible = status_view_matches(self._status_view, "completed")
+        self.notify(f"\uf058 Done {'shown' if visible else 'hidden'}")
 
     def action_filter(self) -> None:
         f = self.query_one("#filter", FilterInput)
@@ -3847,9 +4460,13 @@ auth: LINEAR_API_KEY env var, [workspaces.*] profiles (or legacy api_key)
 keys: enter open ticket   n new   s status   p priority   c comment
       a assign   l labels   P project   o browser   y yank   / filter
       w workspace / All view   m mine only   v group
+      F status view   d show / hide Done   C cycle view
       V one project   t theme
       , settings   j/k navigate   g/G top/bottom   r refresh   ? help
       q quit
+
+views: Active = Todo + Started (not Backlog or Triage). F can include any
+       status type; C offers current, next, previous, no cycle, or named cycles.
 
 arrows: up/down move · left/right walk the panes teams - issues - detail
         (right on a ticket opens it; every list takes arrows everywhere)

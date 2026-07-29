@@ -577,6 +577,9 @@ DEFAULT_KEYBINDS = {
     "toggle_done": (["d"], None),
     "toggle_mine": (["m"], "mine"),
     "toggle_group": (["v"], "group"),
+    "toggle_teams_panel": (["1"], None),
+    "toggle_issues_panel": (["2"], None),
+    "toggle_detail_panel": (["3"], None),
     "pick_project": (["V"], None),
     "pick_cycle": (["C"], None),
     "cycle_theme": (["t"], "theme"),
@@ -639,6 +642,9 @@ CONFIG_TEMPLATE = """{
     "toggle_done": "d",
     "toggle_mine": "m",
     "toggle_group": "v",
+    "toggle_teams_panel": "1",
+    "toggle_issues_panel": "2",
+    "toggle_detail_panel": "3",
     "pick_project": "V",
     "pick_cycle": "C",
     "cycle_theme": "t",
@@ -1915,6 +1921,7 @@ class HelpModal(ModalScreen):
             (":", "command palette"),
             ("j/k ↑↓", "move around lists and the detail panel"),
             ("← / →", "switch panes — → on a ticket opens it"),
+            ("1 / 2 / 3", "toggle Teams / Issues / Detail panels"),
             ("g / G", "jump to top / bottom"),
             ("enter", "open ticket detail (click works too)"),
             ("esc", "close panel · dismiss modal · clear filter"),
@@ -2054,6 +2061,8 @@ class LTUI(App):
     #split-left.dragging, #split-right.dragging {{ background: $ltui-border; }}
     #split-right {{ display: none; }}
     #split-right.open {{ display: block; }}
+    #sidebar.collapsed, #centre.collapsed, #detail.collapsed,
+    #split-left.collapsed, #split-right.collapsed {{ display: none; }}
     #teams {{
         height: 1fr;
         border: round $ltui-border; border-title-color: {C_SUB};
@@ -2275,6 +2284,9 @@ class LTUI(App):
         self._filter = ""
         self._project_filter: str | None = None  # project id, "" = no-project
         self._detail_issue: dict | None = None
+        self._teams_panel_visible = True
+        self._issues_panel_visible = True
+        self._detail_panel_width: int | None = None
         self._wave_pos = -1
         self._wave_rest = 0
         self._refreshing = False
@@ -2430,10 +2442,22 @@ class LTUI(App):
         self.theme = (
             saved_theme if saved_theme in self.available_themes else THEME_NAMES[0]
         )
+        teams_visible = state.get("teams_panel_visible", True)
+        issues_visible = state.get("issues_panel_visible", True)
+        self._teams_panel_visible = (
+            teams_visible if isinstance(teams_visible, bool) else True
+        )
+        self._issues_panel_visible = (
+            issues_visible if isinstance(issues_visible, bool) else True
+        )
+        if not self._teams_panel_visible and not self._issues_panel_visible:
+            self._issues_panel_visible = True
         sidebar = self.query_one("#sidebar")
-        detail = self.query_one("#detail")
         sidebar.styles.width = int(state["sidebar_w"]) if state.get("sidebar_w") else None
-        detail.styles.width = int(state["detail_w"]) if state.get("detail_w") else None
+        self._detail_panel_width = (
+            int(state["detail_w"]) if state.get("detail_w") else None
+        )
+        self._sync_panel_layout()
 
     def _make_client(self, key: str):
         return httpx.AsyncClient(
@@ -2491,6 +2515,59 @@ class LTUI(App):
         return variables
 
     # ── layout ────────────────────────────────────────────────────────
+    def _set_panel_collapsed(self, selector: str, collapsed: bool) -> None:
+        widget = self.query_one(selector)
+        if collapsed:
+            widget.add_class("collapsed")
+        else:
+            widget.remove_class("collapsed")
+
+    def _detail_panel_open(self) -> bool:
+        return self._detail_issue is not None and self.query_one("#detail").has_class(
+            "open"
+        )
+
+    def _sync_panel_layout(self) -> None:
+        """Apply pane visibility and only keep useful splitters on screen."""
+        detail_open = self._detail_panel_open()
+        detail_only = (
+            detail_open
+            and not self._teams_panel_visible
+            and not self._issues_panel_visible
+        )
+        detail = self.query_one("#detail")
+        detail.styles.width = "1fr" if detail_only else self._detail_panel_width
+        detail.styles.min_width = 0 if detail_only else None
+        self._set_panel_collapsed("#sidebar", not self._teams_panel_visible)
+        self._set_panel_collapsed("#centre", not self._issues_panel_visible)
+        self._set_panel_collapsed("#detail", not detail_open)
+        self._set_panel_collapsed(
+            "#split-left",
+            not (
+                self._teams_panel_visible
+                and (self._issues_panel_visible or detail_open)
+            ),
+        )
+        self._set_panel_collapsed(
+            "#split-right",
+            not (
+                detail_open
+                and (self._teams_panel_visible or self._issues_panel_visible)
+            ),
+        )
+
+    def _focus_available_panel(self, *panels: str) -> None:
+        for panel in panels:
+            if panel == "teams" and self._teams_panel_visible:
+                self.query_one("#teams", NavList).focus()
+                return
+            if panel == "issues" and self._issues_panel_visible:
+                self.query_one("#issues", NavList).focus()
+                return
+            if panel == "detail" and self._detail_panel_open():
+                self.query_one("#d-scroll", DetailScroll).focus()
+                return
+
     def compose(self) -> ComposeResult:
         yield Static(id="appheader")
         with Horizontal(id="main"):
@@ -2935,9 +3012,13 @@ class LTUI(App):
             data["sidebar_w"] = self.query_one("#sidebar").outer_size.width
         detail = self.query_one("#detail")
         if reset == "#detail":
+            self._detail_panel_width = None
             data.pop("detail_w", None)
-        elif detail.has_class("open"):
-            data["detail_w"] = detail.outer_size.width
+        elif detail.has_class("open") and (
+            self._teams_panel_visible or self._issues_panel_visible
+        ):
+            self._detail_panel_width = detail.outer_size.width
+            data["detail_w"] = self._detail_panel_width
         save_state(self._storage, self.active_workspace, data)
 
     def _save_state(self) -> None:
@@ -2951,6 +3032,8 @@ class LTUI(App):
         data["group_by"] = self._group_by
         data["status_view"] = status_view_to_state(self._status_view)
         data["cycle_view"] = cycle_view_to_state(self._cycle_view)
+        data["teams_panel_visible"] = self._teams_panel_visible
+        data["issues_panel_visible"] = self._issues_panel_visible
         save_state(self._storage, self.active_workspace, data)
 
     @staticmethod
@@ -3579,6 +3662,7 @@ class LTUI(App):
         was_closed = not panel.has_class("open")
         panel.add_class("open")
         self.query_one("#split-right").add_class("open")
+        self._sync_panel_layout()
         if was_closed:
             pop_in(panel, duration=0.18)
         panel.border_title = f"  {issue['identifier']} "
@@ -3644,7 +3728,11 @@ class LTUI(App):
         self._detail_issue = None
         self.query_one("#detail").remove_class("open")
         self.query_one("#split-right").remove_class("open")
-        self.query_one("#issues").focus()
+        if not self._teams_panel_visible and not self._issues_panel_visible:
+            self._issues_panel_visible = True
+            self._save_state()
+        self._sync_panel_layout()
+        self._focus_available_panel("issues", "teams")
 
     def _current_issue(self) -> dict | None:
         if self._detail_issue is not None:
@@ -3832,6 +3920,7 @@ class LTUI(App):
         await self.query_one("#d-comments", Vertical).remove_children()
         self.query_one("#detail").remove_class("open")
         self.query_one("#split-right").remove_class("open")
+        self._sync_panel_layout()
         self._update_profile()
 
     def action_refresh(self) -> None:
@@ -4081,25 +4170,79 @@ class LTUI(App):
         ol.focus()
 
     def action_focus_left(self) -> None:
-        """← walks panes: detail → issues → teams. No-op inside modals."""
+        """← walks the currently visible panes."""
         fid = self.focused.id if self.focused else None
         if fid == "d-scroll":
-            self.query_one("#issues", NavList).focus()
-        elif fid == "issues":
-            self.query_one("#teams", NavList).focus()
+            self._focus_available_panel("issues", "teams")
+        elif fid in ("issues", "filter"):
+            self._focus_available_panel("teams")
 
     def action_focus_right(self) -> None:
-        """→ walks panes: teams → issues → detail, opening it if needed."""
+        """→ walks visible panes, opening Detail for the current issue."""
         fid = self.focused.id if self.focused else None
         if fid == "teams":
-            self.query_one("#issues", NavList).focus()
-        elif fid == "issues":
+            if self._issues_panel_visible:
+                self._focus_available_panel("issues")
+                return
+            if self._detail_panel_open():
+                self._focus_available_panel("detail")
+                return
+            issue = self._current_issue()
+            if issue is not None:
+                self.show_detail(issue)
+                self._focus_available_panel("detail")
+        elif fid in ("issues", "filter"):
             issue = self._current_issue()
             if issue is None:
                 return
             if self._detail_issue is None:
                 self.show_detail(issue)
-            self.query_one("#d-scroll").focus()
+            self._focus_available_panel("detail")
+
+    def action_toggle_teams_panel(self) -> None:
+        hiding_last = (
+            self._teams_panel_visible
+            and not self._issues_panel_visible
+            and not self._detail_panel_open()
+        )
+        if hiding_last:
+            self.notify("keep at least one panel visible")
+            return
+        self._teams_panel_visible = not self._teams_panel_visible
+        self._sync_panel_layout()
+        if self._teams_panel_visible:
+            self._focus_available_panel("teams")
+        elif self.focused and self.focused.id == "teams":
+            self._focus_available_panel("issues", "detail")
+        self._save_state()
+
+    def action_toggle_issues_panel(self) -> None:
+        hiding_last = (
+            self._issues_panel_visible
+            and not self._teams_panel_visible
+            and not self._detail_panel_open()
+        )
+        if hiding_last:
+            self.notify("keep at least one panel visible")
+            return
+        self._issues_panel_visible = not self._issues_panel_visible
+        self._sync_panel_layout()
+        if self._issues_panel_visible:
+            self._focus_available_panel("issues")
+        elif self.focused and self.focused.id in ("issues", "filter"):
+            self._focus_available_panel("detail", "teams")
+        self._save_state()
+
+    def action_toggle_detail_panel(self) -> None:
+        if self._detail_panel_open():
+            self.close_detail()
+            return
+        issue = self._current_issue()
+        if issue is None:
+            self.notify("select an issue to open Detail")
+            return
+        self.show_detail(issue)
+        self._focus_available_panel("detail")
 
     def action_toggle_group(self) -> None:
         groups = (
@@ -4490,7 +4633,7 @@ keys: enter open ticket   n new   s status   p priority   c comment
       a assign   l labels   P project   o browser   y yank   / filter
       w workspace / All view   m mine only   v group
       F status view   d show / hide Done   C cycle view
-      V one project   t theme
+      V one project   t theme   1 / 2 / 3 toggle Teams / Issues / Detail
       , settings   j/k navigate   g/G top/bottom   r refresh   ? help
       q quit
 

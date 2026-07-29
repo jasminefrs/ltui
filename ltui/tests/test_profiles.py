@@ -822,6 +822,128 @@ class ThemeReadabilityTests(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(segment.style.bgcolor.is_default)
 
 
+class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.storage = ltui.StoragePaths(
+            config=root / "config.toml",
+            linear_config=root / "linear.toml",
+            state_root=root / "state",
+            cache_root=root / "cache",
+        )
+        ltui.save_state(self.storage, "work", {"welcomed": True})
+        self.calls: list[tuple] = []
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def factory(self, key: str) -> AggregateFakeClient:
+        return AggregateFakeClient(key, self.calls)
+
+    async def test_teams_and_issues_panels_toggle_with_safe_focus(self) -> None:
+        app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with app.run_test(size=(100, 24)) as pilot:
+            await wait_for_workers(app)
+
+            app.action_toggle_teams_panel()
+            await pilot.pause()
+            self.assertTrue(app.query_one("#sidebar").has_class("collapsed"))
+            self.assertTrue(app.query_one("#split-left").has_class("collapsed"))
+            self.assertEqual(app.focused.id, "issues")
+
+            app.action_toggle_teams_panel()
+            await pilot.pause()
+            self.assertFalse(app.query_one("#sidebar").has_class("collapsed"))
+            self.assertFalse(app.query_one("#split-left").has_class("collapsed"))
+            self.assertEqual(app.focused.id, "teams")
+
+            app.action_toggle_issues_panel()
+            await pilot.pause()
+            self.assertTrue(app.query_one("#centre").has_class("collapsed"))
+            self.assertEqual(app.focused.id, "teams")
+
+    async def test_detail_only_mode_restores_issues_when_detail_closes(self) -> None:
+        app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with app.run_test(size=(80, 20)) as pilot:
+            await wait_for_workers(app)
+
+            app.action_toggle_detail_panel()
+            await wait_for_workers(app)
+            await pilot.pause()
+            detail = app.query_one("#detail")
+            self.assertTrue(detail.has_class("open"))
+            self.assertEqual(app.focused.id, "d-scroll")
+            split_width = detail.outer_size.width
+
+            app.action_toggle_teams_panel()
+            app.action_toggle_issues_panel()
+            await pilot.pause()
+            self.assertTrue(app.query_one("#sidebar").has_class("collapsed"))
+            self.assertTrue(app.query_one("#centre").has_class("collapsed"))
+            self.assertFalse(detail.has_class("collapsed"))
+            self.assertEqual(
+                detail.outer_size.width,
+                app.query_one("#main").content_size.width,
+            )
+
+            app.action_toggle_issues_panel()
+            await pilot.pause()
+            self.assertEqual(detail.outer_size.width, split_width)
+            app.action_toggle_issues_panel()
+            await pilot.pause()
+
+            app.action_toggle_detail_panel()
+            await pilot.pause()
+            self.assertFalse(app.query_one("#detail").has_class("open"))
+            self.assertFalse(app.query_one("#centre").has_class("collapsed"))
+            self.assertEqual(app.focused.id, "issues")
+
+    async def test_panel_visibility_is_persisted_per_workspace(self) -> None:
+        app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with app.run_test() as pilot:
+            await wait_for_workers(app)
+            app.action_toggle_teams_panel()
+            await pilot.pause()
+
+        state = ltui.load_state(self.storage, "work")
+        self.assertFalse(state["teams_panel_visible"])
+        self.assertTrue(state["issues_panel_visible"])
+
+        fresh = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with fresh.run_test() as pilot:
+            await wait_for_workers(fresh)
+            await pilot.pause()
+            self.assertTrue(fresh.query_one("#sidebar").has_class("collapsed"))
+            self.assertFalse(fresh.query_one("#centre").has_class("collapsed"))
+
+    async def test_arrow_navigation_skips_collapsed_panels(self) -> None:
+        app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with app.run_test() as pilot:
+            await wait_for_workers(app)
+
+            app.action_toggle_detail_panel()
+            await wait_for_workers(app)
+            app.action_toggle_issues_panel()
+            app.query_one("#teams", ltui.NavList).focus()
+            await pilot.pause()
+            app.action_focus_right()
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "d-scroll")
+
+            app.action_focus_left()
+            await pilot.pause()
+            self.assertEqual(app.focused.id, "teams")
+
+    def test_panel_toggle_bindings_are_remappable(self) -> None:
+        bindings = {binding.key: binding.action for binding in ltui.build_bindings({})}
+
+        self.assertEqual(bindings["1"], "toggle_teams_panel")
+        self.assertEqual(bindings["2"], "toggle_issues_panel")
+        self.assertEqual(bindings["3"], "toggle_detail_panel")
+        self.assertIn("1 / 2 / 3", ltui.HELP)
+
+
 class CycleViewTests(unittest.TestCase):
     def test_issue_and_cycle_queries_are_split_below_complexity_limit(self) -> None:
         for field in (

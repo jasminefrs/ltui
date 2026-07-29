@@ -215,6 +215,7 @@ and `?` opens the full keybinding cheatsheet whenever you need it.
 | -------- | --------------------------------------------- |
 | `↑↓` `jk` | move around (lists *and* the detail panel)   |
 | `←` `→`  | walk the panes: teams ◂ issues ▸ detail — `→` on a ticket opens it |
+| `1` `2` `3` | toggle the **Teams / Issues / Detail** panels |
 | `enter` / click | open ticket detail panel                |
 | `esc`    | close panel / dismiss modal / clear filter    |
 | `n`      | **new ticket** (prompts for a workspace in All) |
@@ -291,6 +292,9 @@ ltui --init-config    # writes ~/.config/ltui/config.json
     "filter_status": "F",
     "toggle_done": "d",
     "pick_cycle": "C",
+    "toggle_teams_panel": "1",
+    "toggle_issues_panel": "2",
+    "toggle_detail_panel": "3",
     "yank": ["y", "ctrl+y"]       // or several keys
   },
   "options": {
@@ -308,7 +312,11 @@ fall back to the defaults; changes apply on restart.
 
 `enter` (or a click) opens any ticket in a side panel — markdown description
 rendered properly, comments threaded underneath, and every action one key away.
-The footer hints are clickable too.
+The footer hints are clickable too. Press `1`, `2`, or `3` to toggle the Teams,
+Issues, or Detail panel. Detail expands to the full available width when it is
+the only visible panel, making the layout practical in narrow terminals.
+Closing Detail restores Issues if it was the only open panel. Teams and Issues
+visibility is remembered separately for each workspace.
 
 <div align="center">
 <img src="assets/picker.png" alt="status picker" width="80%">

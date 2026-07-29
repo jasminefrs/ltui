@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 import ltui
 from textual.worker import WorkerCancelled, WorkerState
@@ -759,6 +760,23 @@ class ThemeReadabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(marker.plain, "!!!")
         self.assertTrue(marker.spans)
 
+    def test_non_urgent_priorities_use_only_solid_blocks(self) -> None:
+        expected = {
+            2: "■■■",
+            3: "■■ ",
+            4: "■  ",
+        }
+
+        for priority, plain in expected.items():
+            with self.subTest(priority=priority):
+                marker = ltui.priority_cell(priority)
+                self.assertEqual(marker.plain, plain)
+                self.assertTrue(marker.spans)
+                self.assertNotIn(
+                    ltui.C_VFAINT,
+                    [span.style for span in marker.spans],
+                )
+
     def test_transparent_theme_modals_use_terminal_background(self) -> None:
         themes = {theme.name: theme for theme in ltui.THEMES}
 
@@ -874,10 +892,23 @@ class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
             detail = app.query_one("#detail")
             self.assertTrue(detail.has_class("open"))
             self.assertEqual(app.focused.id, "d-scroll")
-            split_width = detail.outer_size.width
+            self.assertTrue(app.query_one("#centre").has_class("collapsed"))
+            self.assertTrue(app._issues_panel_visible)
+            self.assertTrue(
+                app.query_one("#split-right").has_class("collapsed")
+            )
+            self.assertEqual(
+                detail.region.right,
+                app.query_one("#main").content_region.right,
+            )
+            self.assertTrue(
+                ltui.load_state(self.storage, "work").get(
+                    "issues_panel_visible", True
+                )
+            )
+            focused_width = detail.outer_size.width
 
             app.action_toggle_teams_panel()
-            app.action_toggle_issues_panel()
             await pilot.pause()
             self.assertTrue(app.query_one("#sidebar").has_class("collapsed"))
             self.assertTrue(app.query_one("#centre").has_class("collapsed"))
@@ -889,7 +920,7 @@ class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
 
             app.action_toggle_issues_panel()
             await pilot.pause()
-            self.assertEqual(detail.outer_size.width, split_width)
+            self.assertLess(detail.outer_size.width, focused_width)
             app.action_toggle_issues_panel()
             await pilot.pause()
 
@@ -898,6 +929,23 @@ class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.query_one("#detail").has_class("open"))
             self.assertFalse(app.query_one("#centre").has_class("collapsed"))
             self.assertEqual(app.focused.id, "issues")
+
+    async def test_detail_focus_mode_can_be_disabled(self) -> None:
+        with patch.dict(
+            ltui.CONFIG_OPTIONS,
+            {"hide_issues_on_detail": False},
+        ):
+            app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+            async with app.run_test() as pilot:
+                await wait_for_workers(app)
+                app.action_toggle_detail_panel()
+                await wait_for_workers(app)
+                await pilot.pause()
+
+                self.assertFalse(
+                    app.query_one("#centre").has_class("collapsed")
+                )
+                self.assertTrue(app.query_one("#detail").has_class("open"))
 
     async def test_panel_visibility_is_persisted_per_workspace(self) -> None:
         app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
@@ -924,7 +972,7 @@ class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
 
             app.action_toggle_detail_panel()
             await wait_for_workers(app)
-            app.action_toggle_issues_panel()
+            self.assertTrue(app.query_one("#centre").has_class("collapsed"))
             app.query_one("#teams", ltui.NavList).focus()
             await pilot.pause()
             app.action_focus_right()
@@ -942,6 +990,7 @@ class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bindings["2"], "toggle_issues_panel")
         self.assertEqual(bindings["3"], "toggle_detail_panel")
         self.assertIn("1 / 2 / 3", ltui.HELP)
+        self.assertIn('"hide_issues_on_detail": true', ltui.CONFIG_TEMPLATE)
 
 
 class CycleViewTests(unittest.TestCase):

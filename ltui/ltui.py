@@ -667,7 +667,8 @@ CONFIG_TEMPLATE = """{
   },
   "options": {
     "auto_refresh_seconds": 180,
-    "animations": true
+    "animations": true,
+    "hide_issues_on_detail": true
   }
 }
 """
@@ -916,9 +917,9 @@ def priority_cell(p: int) -> Text:
     if p == 1:
         t.append("!!!", style=f"bold {C_RED}")
     elif p in (2, 3, 4):
-        lit = {2: 3, 3: 2, 4: 1}[p]
-        for i, ch in enumerate("▂▄▆"):
-            t.append(ch, style=C_SUB if i < lit else C_VFAINT)
+        blocks = {2: 3, 3: 2, 4: 1}[p]
+        t.append("■" * blocks, style=C_SUB)
+        t.append(" " * (3 - blocks))
     else:
         t.append("···", style=C_VFAINT)
     return t
@@ -1923,7 +1924,7 @@ class HelpModal(ModalScreen):
             ("← / →", "switch panes — → on a ticket opens it"),
             ("1 / 2 / 3", "toggle Teams / Issues / Detail panels"),
             ("g / G", "jump to top / bottom"),
-            ("enter", "open ticket detail (click works too)"),
+            ("enter", "open ticket detail and focus it (click works too)"),
             ("esc", "close panel · dismiss modal · clear filter"),
         ]),
         ("ticket", [
@@ -2286,7 +2287,14 @@ class LTUI(App):
         self._detail_issue: dict | None = None
         self._teams_panel_visible = True
         self._issues_panel_visible = True
+        self._issues_panel_auto_hidden = False
         self._detail_panel_width: int | None = None
+        hide_issues_on_detail = CONFIG_OPTIONS.get("hide_issues_on_detail", True)
+        self._hide_issues_on_detail = (
+            hide_issues_on_detail
+            if isinstance(hide_issues_on_detail, bool)
+            else True
+        )
         self._wave_pos = -1
         self._wave_rest = 0
         self._refreshing = False
@@ -2450,6 +2458,7 @@ class LTUI(App):
         self._issues_panel_visible = (
             issues_visible if isinstance(issues_visible, bool) else True
         )
+        self._issues_panel_auto_hidden = False
         if not self._teams_panel_visible and not self._issues_panel_visible:
             self._issues_panel_visible = True
         sidebar = self.query_one("#sidebar")
@@ -2527,33 +2536,30 @@ class LTUI(App):
             "open"
         )
 
+    def _issues_panel_is_visible(self) -> bool:
+        return self._issues_panel_visible and not self._issues_panel_auto_hidden
+
     def _sync_panel_layout(self) -> None:
         """Apply pane visibility and only keep useful splitters on screen."""
         detail_open = self._detail_panel_open()
-        detail_only = (
-            detail_open
-            and not self._teams_panel_visible
-            and not self._issues_panel_visible
-        )
+        issues_visible = self._issues_panel_is_visible()
+        detail_expanded = detail_open and not issues_visible
         detail = self.query_one("#detail")
-        detail.styles.width = "1fr" if detail_only else self._detail_panel_width
-        detail.styles.min_width = 0 if detail_only else None
+        detail.styles.width = "1fr" if detail_expanded else self._detail_panel_width
+        detail.styles.min_width = 0 if detail_expanded else None
         self._set_panel_collapsed("#sidebar", not self._teams_panel_visible)
-        self._set_panel_collapsed("#centre", not self._issues_panel_visible)
+        self._set_panel_collapsed("#centre", not issues_visible)
         self._set_panel_collapsed("#detail", not detail_open)
         self._set_panel_collapsed(
             "#split-left",
             not (
                 self._teams_panel_visible
-                and (self._issues_panel_visible or detail_open)
+                and (issues_visible or detail_open)
             ),
         )
         self._set_panel_collapsed(
             "#split-right",
-            not (
-                detail_open
-                and (self._teams_panel_visible or self._issues_panel_visible)
-            ),
+            not (detail_open and issues_visible),
         )
 
     def _focus_available_panel(self, *panels: str) -> None:
@@ -2561,7 +2567,7 @@ class LTUI(App):
             if panel == "teams" and self._teams_panel_visible:
                 self.query_one("#teams", NavList).focus()
                 return
-            if panel == "issues" and self._issues_panel_visible:
+            if panel == "issues" and self._issues_panel_is_visible():
                 self.query_one("#issues", NavList).focus()
                 return
             if panel == "detail" and self._detail_panel_open():
@@ -3014,9 +3020,7 @@ class LTUI(App):
         if reset == "#detail":
             self._detail_panel_width = None
             data.pop("detail_w", None)
-        elif detail.has_class("open") and (
-            self._teams_panel_visible or self._issues_panel_visible
-        ):
+        elif detail.has_class("open") and self._issues_panel_is_visible():
             self._detail_panel_width = detail.outer_size.width
             data["detail_w"] = self._detail_panel_width
         save_state(self._storage, self.active_workspace, data)
@@ -3660,6 +3664,10 @@ class LTUI(App):
         children_w.remove_children()
         panel = self.query_one("#detail")
         was_closed = not panel.has_class("open")
+        if was_closed:
+            self._issues_panel_auto_hidden = (
+                self._hide_issues_on_detail and self._issues_panel_visible
+            )
         panel.add_class("open")
         self.query_one("#split-right").add_class("open")
         self._sync_panel_layout()
@@ -3726,6 +3734,7 @@ class LTUI(App):
 
     def close_detail(self) -> None:
         self._detail_issue = None
+        self._issues_panel_auto_hidden = False
         self.query_one("#detail").remove_class("open")
         self.query_one("#split-right").remove_class("open")
         if not self._teams_panel_visible and not self._issues_panel_visible:
@@ -3891,6 +3900,7 @@ class LTUI(App):
         self._filter = ""
         self._project_filter = None
         self._detail_issue = None
+        self._issues_panel_auto_hidden = False
         self._opt_index = {}
         self._issue_by_id = {}
         self._header_indices = []
@@ -4181,7 +4191,7 @@ class LTUI(App):
         """→ walks visible panes, opening Detail for the current issue."""
         fid = self.focused.id if self.focused else None
         if fid == "teams":
-            if self._issues_panel_visible:
+            if self._issues_panel_is_visible():
                 self._focus_available_panel("issues")
                 return
             if self._detail_panel_open():
@@ -4202,7 +4212,7 @@ class LTUI(App):
     def action_toggle_teams_panel(self) -> None:
         hiding_last = (
             self._teams_panel_visible
-            and not self._issues_panel_visible
+            and not self._issues_panel_is_visible()
             and not self._detail_panel_open()
         )
         if hiding_last:
@@ -4217,6 +4227,11 @@ class LTUI(App):
         self._save_state()
 
     def action_toggle_issues_panel(self) -> None:
+        if self._issues_panel_auto_hidden:
+            self._issues_panel_auto_hidden = False
+            self._sync_panel_layout()
+            self._focus_available_panel("issues")
+            return
         hiding_last = (
             self._issues_panel_visible
             and not self._teams_panel_visible
@@ -4622,8 +4637,8 @@ HELP = """ltui - a fast, clean TUI for Linear   https://github.com/Gheat1/ltui
 usage: ltui [--version] [--help] [--init-config]
 
 config: ~/.config/ltui/config.json remaps any keybind and sets options
-        (auto_refresh_seconds, animations). ltui --init-config writes a
-        starter file. changes apply on restart.
+        (auto_refresh_seconds, animations, hide_issues_on_detail).
+        ltui --init-config writes a starter file; changes apply on restart.
 
 auth: LINEAR_API_KEY env var, [workspaces.*] profiles (or legacy api_key)
       in ~/.config/ltui/config.toml, then linear-cli's config.
@@ -4639,6 +4654,9 @@ keys: enter open ticket   n new   s status   p priority   c comment
 
 views: Active = Todo + Started (not Backlog or Triage). F can include any
        status type; C offers current, next, previous, no cycle, or named cycles.
+
+detail: opening hides Issues by default; press 2 to reveal it, or set
+        hide_issues_on_detail to false in config.json to keep the split view.
 
 arrows: up/down move · left/right walk the panes teams - issues - detail
         (right on a ticket opens it; every list takes arrows everywhere)

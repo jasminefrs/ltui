@@ -299,7 +299,8 @@ ltui --init-config    # writes ~/.config/ltui/config.json
   },
   "options": {
     "auto_refresh_seconds": 180,  // 0 disables background sync
-    "animations": true            // false = no fades, no name wave
+    "animations": true,           // false = no fades, no name wave
+    "hide_issues_on_detail": true // false keeps Issues beside Detail
   }
 }
 ```
@@ -313,10 +314,13 @@ fall back to the defaults; changes apply on restart.
 `enter` (or a click) opens any ticket in a side panel — markdown description
 rendered properly, comments threaded underneath, and every action one key away.
 The footer hints are clickable too. Press `1`, `2`, or `3` to toggle the Teams,
-Issues, or Detail panel. Detail expands to the full available width when it is
-the only visible panel, making the layout practical in narrow terminals.
-Closing Detail restores Issues if it was the only open panel. Teams and Issues
-visibility is remembered separately for each workspace.
+Issues, or Detail panel. Opening Detail hides Issues by default so the ticket
+gets the available space; press `2` to reveal Issues again. Closing Detail
+restores your saved panel layout. Detail expands to the full available width
+when it is the only visible panel, making the layout practical in narrow
+terminals. Set `hide_issues_on_detail` to `false` to keep the split view when a
+ticket opens. Teams and Issues visibility is remembered separately for each
+workspace.
 
 <div align="center">
 <img src="assets/picker.png" alt="status picker" width="80%">

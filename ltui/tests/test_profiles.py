@@ -300,6 +300,34 @@ class AggregateFakeClient:
                     }
                 }
             )
+        if query == ltui.QL_TEAM_PROJECTS:
+            return FakeResponse(
+                {
+                    "data": {
+                        "team": {
+                            "projects": {
+                                "nodes": [
+                                    {
+                                        "id": "shared-project",
+                                        "name": f"{self.name} Project",
+                                        "color": "#abcdef",
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            )
+        if query == ltui.M_CREATE:
+            issue = aggregate_issue(self.name)
+            issue["id"] = f"{self.name.lower()}-created"
+            issue["identifier"] = f"{self.name[:1].upper()}-99"
+            issue["title"] = variables["input"]["title"]
+            issue["description"] = variables["input"].get("description")
+            issue["priority"] = variables["input"].get("priority", 0)
+            return FakeResponse(
+                {"data": {"issueCreate": {"success": True, "issue": issue}}}
+            )
         raise AssertionError("unexpected aggregate GraphQL query")
 
     async def aclose(self) -> None:
@@ -984,13 +1012,25 @@ class PanelVisibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.focused.id, "teams")
 
     def test_panel_toggle_bindings_are_remappable(self) -> None:
-        bindings = {binding.key: binding.action for binding in ltui.build_bindings({})}
+        all_bindings = ltui.build_bindings({})
+        bindings = {binding.key: binding.action for binding in all_bindings}
+        footer_actions = {
+            binding.action
+            for binding in all_bindings
+            if binding.show
+        }
 
         self.assertEqual(bindings["1"], "toggle_teams_panel")
         self.assertEqual(bindings["2"], "toggle_issues_panel")
         self.assertEqual(bindings["3"], "toggle_detail_panel")
         self.assertIn("1 / 2 / 3", ltui.HELP)
         self.assertIn('"hide_issues_on_detail": true', ltui.CONFIG_TEMPLATE)
+        self.assertIn("filter_status", footer_actions)
+        self.assertIn("pick_cycle", footer_actions)
+        self.assertNotIn("filter", footer_actions)
+        self.assertNotIn("toggle_mine", footer_actions)
+        self.assertNotIn("toggle_group", footer_actions)
+        self.assertNotIn("cycle_theme", footer_actions)
 
 
 class CycleViewTests(unittest.TestCase):
@@ -1520,6 +1560,54 @@ class AllWorkspacesTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(picker.option_count, 3)
             self.assertIn("All workspaces", labels)
+
+    async def test_new_ticket_supports_optional_workflow_fields(self) -> None:
+        minimal = ltui.NewIssueDraft("Title only")
+        self.assertEqual(
+            ltui.issue_create_input({"id": "team-1"}, minimal),
+            {"teamId": "team-1", "title": "Title only"},
+        )
+
+        app = ltui.LTUI(profile_resolution(), self.storage, self.factory)
+        async with app.run_test() as pilot:
+            await wait_for_workers(app)
+            app.action_new_ticket()
+            await wait_for_workers(app)
+            await pilot.pause()
+
+            self.assertIsInstance(app.screen, ltui.NewTicketModal)
+            modal = app.screen
+            modal.query_one("#ticket-title", ltui.Input).value = "Configured issue"
+            modal.query_one("#ticket-status", ltui.Select).value = "shared-state"
+            modal.query_one("#ticket-priority", ltui.Select).value = 2
+            modal.query_one("#ticket-assignee", ltui.Select).value = "shared-member"
+            modal.query_one("#ticket-project", ltui.Select).value = "shared-project"
+            modal.query_one("#ticket-cycle", ltui.Select).value = "shared-current-cycle"
+            modal.action_submit()
+            await wait_for_workers(app)
+            await pilot.pause()
+
+            create_calls = [
+                variables
+                for key, query, variables in self.calls
+                if key == "work-secret" and query == ltui.M_CREATE
+            ]
+            self.assertEqual(
+                create_calls,
+                [
+                    {
+                        "input": {
+                            "teamId": "shared-team",
+                            "title": "Configured issue",
+                            "stateId": "shared-state",
+                            "priority": 2,
+                            "assigneeId": "shared-member",
+                            "projectId": "shared-project",
+                            "cycleId": "shared-current-cycle",
+                        }
+                    }
+                ],
+            )
 
     async def test_clear_all_caches_preserves_aggregate_preferences(self) -> None:
         app = ltui.LTUI(self.resolution, self.storage, self.factory)

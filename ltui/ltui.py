@@ -37,7 +37,16 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme
 from textual.strip import Strip
-from textual.widgets import Button, Footer, Input, Markdown, OptionList, Static, TextArea
+from textual.widgets import (
+    Button,
+    Footer,
+    Input,
+    Markdown,
+    OptionList,
+    Select,
+    Static,
+    TextArea,
+)
 from textual.widgets.option_list import Option
 from textual.worker import WorkerCancelled, WorkerState
 
@@ -415,6 +424,32 @@ def cycle_view_matches(view: CycleView, issue: dict, workspace: str) -> bool:
 
 PRIORITIES = [(1, "Urgent"), (2, "High"), (3, "Medium"), (4, "Low"), (0, "No priority")]
 
+
+@dataclass(frozen=True)
+class NewIssueDraft:
+    title: str
+    description: str | None = None
+    state_id: str | None = None
+    priority: int | None = None
+    assignee_id: str | None = None
+    project_id: str | None = None
+    cycle_id: str | None = None
+
+
+def issue_create_input(team: dict, draft: NewIssueDraft) -> dict:
+    """Build a Linear create payload without overriding unspecified defaults."""
+    data: dict = {"teamId": team["id"], "title": draft.title}
+    optional = (
+        ("description", draft.description),
+        ("stateId", draft.state_id),
+        ("priority", draft.priority),
+        ("assigneeId", draft.assignee_id),
+        ("projectId", draft.project_id),
+        ("cycleId", draft.cycle_id),
+    )
+    data.update((name, value) for name, value in optional if value is not None)
+    return data
+
 # ── graphql ───────────────────────────────────────────────────────────────
 CYCLE_FIELDS = """
         id name number startsAt endsAt
@@ -464,8 +499,8 @@ query($teamId: String!) {{
 }}"""
 
 M_CREATE = f"""
-mutation($teamId: String!, $title: String!, $desc: String) {{
-  issueCreate(input: {{teamId: $teamId, title: $title, description: $desc}}) {{
+mutation($input: IssueCreateInput!) {{
+  issueCreate(input: $input) {{
     success
     issue {{ {ISSUE_FIELDS} }}
   }}
@@ -572,17 +607,17 @@ DEFAULT_KEYBINDS = {
     "new_ticket": (["n"], "new"),
     "change_status": (["s"], "status"),
     "add_comment": (["c"], "comment"),
-    "filter": (["slash"], "filter"),
-    "filter_status": (["F"], None),
+    "filter": (["slash"], None),
+    "filter_status": (["F"], "status view"),
     "toggle_done": (["d"], None),
-    "toggle_mine": (["m"], "mine"),
-    "toggle_group": (["v"], "group"),
+    "toggle_mine": (["m"], None),
+    "toggle_group": (["v"], None),
     "toggle_teams_panel": (["1"], None),
     "toggle_issues_panel": (["2"], None),
     "toggle_detail_panel": (["3"], None),
     "pick_project": (["V"], None),
-    "pick_cycle": (["C"], None),
-    "cycle_theme": (["t"], "theme"),
+    "pick_cycle": (["C"], "cycles"),
+    "cycle_theme": (["t"], None),
     "open_settings": (["comma"], None),
     "switch_workspace": (["w"], None),
     "help": (["question_mark"], "help"),
@@ -1436,18 +1471,121 @@ class NewTicketModal(ModalScreen):
         Binding("ctrl+s", "submit", show=False),
     ]
 
-    def __init__(self, heading: str) -> None:
+    def __init__(
+        self,
+        heading: str,
+        *,
+        states: list[dict] | None = None,
+        members: list[dict] | None = None,
+        projects: list[dict] | None = None,
+        cycles: list[dict] | None = None,
+    ) -> None:
         super().__init__()
         self._heading = heading
+        self._states = sorted(states or [], key=state_sort_key)
+        self._members = sorted(
+            members or [], key=lambda member: member["displayName"].lower()
+        )
+        self._projects = sorted(
+            projects or [], key=lambda project: project["name"].lower()
+        )
+        self._cycles = sorted(cycles or [], key=cycle_sort_key)
+
+    @staticmethod
+    def _option(prefix: str, value: str, color: str = C_TEXT) -> Text:
+        row = Text(f"{prefix} · ", style=C_DIM)
+        row.append(value, style=color)
+        return row
+
+    def _status_options(self) -> list[tuple[Text, str]]:
+        return [
+            (
+                self._option(
+                    "status",
+                    f"{state_icon(state)} {state['name']}",
+                    state.get("color") or C_TEXT,
+                ),
+                state["id"],
+            )
+            for state in self._states
+        ]
+
+    def _priority_options(self) -> list[tuple[Text, int]]:
+        return [
+            (self._option("priority", name), priority)
+            for priority, name in PRIORITIES
+        ]
+
+    def _member_options(self) -> list[tuple[Text, str]]:
+        return [
+            (self._option("assignee", member["displayName"]), member["id"])
+            for member in self._members
+        ]
+
+    def _project_options(self) -> list[tuple[Text, str]]:
+        return [
+            (
+                self._option(
+                    "project",
+                    project["name"],
+                    project.get("color") or C_TEXT,
+                ),
+                project["id"],
+            )
+            for project in self._projects
+        ]
+
+    def _cycle_options(self) -> list[tuple[Text, str]]:
+        return [
+            (self._option("cycle", cycle_name(cycle), C_MAUVE), cycle["id"])
+            for cycle in self._cycles
+        ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ticket-box"):
             yield Static(self._heading, id="ticket-heading")
             yield Input(placeholder="title", id="ticket-title")
+            with Horizontal(id="ticket-fields"):
+                with Vertical(classes="ticket-field-column"):
+                    yield Select(
+                        self._status_options(),
+                        prompt="status · default",
+                        compact=True,
+                        disabled=not self._states,
+                        id="ticket-status",
+                    )
+                    yield Select(
+                        self._priority_options(),
+                        prompt="priority · default",
+                        compact=True,
+                        id="ticket-priority",
+                    )
+                    yield Select(
+                        self._member_options(),
+                        prompt="assignee · default",
+                        compact=True,
+                        disabled=not self._members,
+                        id="ticket-assignee",
+                    )
+                with Vertical(classes="ticket-field-column"):
+                    yield Select(
+                        self._project_options(),
+                        prompt="project · default",
+                        compact=True,
+                        disabled=not self._projects,
+                        id="ticket-project",
+                    )
+                    yield Select(
+                        self._cycle_options(),
+                        prompt="cycle · default",
+                        compact=True,
+                        disabled=not self._cycles,
+                        id="ticket-cycle",
+                    )
             yield TextArea(id="ticket-desc")
             with Horizontal(id="ticket-actions"):
                 yield Static(
-                    f"[{C_DIM}]description is optional · ctrl+s to create · esc to cancel[/]",
+                    f"[{C_DIM}]only title is required · ctrl+s create · esc cancel[/]",
                     id="ticket-hint",
                 )
                 yield Button("cancel", id="ticket-cancel")
@@ -1476,7 +1614,25 @@ class NewTicketModal(ModalScreen):
             self.query_one("#ticket-title").focus()
             return
         desc = self.query_one("#ticket-desc", TextArea).text.strip()
-        self.dismiss((title, desc or None))
+        values = {
+            name: self.query_one(f"#ticket-{name}", Select).value
+            for name in ("status", "priority", "assignee", "project", "cycle")
+        }
+        selected = {
+            name: None if value is Select.NULL else value
+            for name, value in values.items()
+        }
+        self.dismiss(
+            NewIssueDraft(
+                title=title,
+                description=desc or None,
+                state_id=selected["status"],
+                priority=selected["priority"],
+                assignee_id=selected["assignee"],
+                project_id=selected["project"],
+                cycle_id=selected["cycle"],
+            )
+        )
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1928,7 +2084,7 @@ class HelpModal(ModalScreen):
             ("esc", "close panel · dismiss modal · clear filter"),
         ]),
         ("ticket", [
-            ("n", "new ticket (choose workspace in All)"),
+            ("n", "new ticket with optional workflow fields"),
             ("s", "change status"),
             ("p", "change priority"),
             ("l", "edit labels"),
@@ -2179,12 +2335,15 @@ class LTUI(App):
 
     NewTicketModal {{ align: center middle; background: $ltui-overlay; }}
     #ticket-box {{
-        width: 72; height: 24;
+        width: 76; height: 28; max-height: 95%;
         background: $ltui-modal-bg; border: round $ltui-border-focus; padding: 1 2;
     }}
     #ticket-heading {{ color: {C_SUB}; text-style: bold; padding: 0 0 1 0; }}
     #ticket-title {{ border: round {C_VFAINT}; background: transparent; }}
     #ticket-title:focus {{ border: round {C_FAINT}; }}
+    #ticket-fields {{ height: 7; margin: 1 0 0 0; }}
+    .ticket-field-column {{ width: 1fr; }}
+    .ticket-field-column Select {{ margin: 0 1 1 0; }}
     #ticket-desc {{ height: 1fr; margin: 1 0 0 0; border: round {C_VFAINT}; background: transparent; }}
     #ticket-desc:focus {{ border: round {C_FAINT}; }}
     #ticket-actions {{ height: 3; margin: 1 0 0 0; }}
@@ -3351,12 +3510,12 @@ class LTUI(App):
         self.notify(f"\uf007 {issue['identifier']} → {name}")
 
     @work(group="mutate")
-    async def create_issue(self, team: dict, title: str, desc: str | None) -> None:
+    async def create_issue(self, team: dict, draft: NewIssueDraft) -> None:
         try:
             data = await self._gql_for_team(
                 team,
                 M_CREATE,
-                {"teamId": team["id"], "title": title, "desc": desc},
+                {"input": issue_create_input(team, draft)},
             )
             issue = data["issueCreate"]["issue"]
         except Exception as e:
@@ -4057,13 +4216,66 @@ class LTUI(App):
             return
         self._open_new_ticket(team)
 
-    def _open_new_ticket(self, team: dict) -> None:
+    @work(exclusive=True, group="new-ticket")
+    async def _open_new_ticket(self, team: dict) -> None:
+        team_key = self._team_key(team)
+        members = self._members.get(team_key)
+        projects = self._team_projects.get(team_key)
+        requests = []
+        if members is None:
+            requests.append(("members", QL_MEMBERS))
+        if projects is None:
+            requests.append(("projects", QL_TEAM_PROJECTS))
+        if requests:
+            self.notify("loading optional issue fields…", timeout=2)
+            results = await asyncio.gather(
+                *(
+                    self._gql_for_team(team, query, {"teamId": team["id"]})
+                    for _name, query in requests
+                ),
+                return_exceptions=True,
+            )
+            for (name, _query), result in zip(requests, results):
+                if isinstance(result, BaseException):
+                    self.notify(
+                        f"{name} unavailable: {result}",
+                        severity="warning",
+                        timeout=6,
+                    )
+                    continue
+                values = result["team"][name]["nodes"]
+                if name == "members":
+                    members = values
+                    self._members[team_key] = values
+                else:
+                    projects = values
+                    self._team_projects[team_key] = values
+        if self._switching:
+            return
+        if not self._is_all_workspaces:
+            if self._team is None or self._team_key(self._team) != team_key:
+                return
+            states = self._states
+            cycles = self._cycles
+        else:
+            workspace = self._team_workspace(team)
+            states = self._workspace_states.get(workspace, [])
+            cycles = self._workspace_cycles.get(workspace, [])
 
-        def done(result: tuple | None) -> None:
-            if result:
-                self.create_issue(team, result[0], result[1])
+        def done(result: NewIssueDraft | None) -> None:
+            if result is not None:
+                self.create_issue(team, result)
 
-        self.push_screen(NewTicketModal(f" new ticket · {team['key']}"), done)
+        self.push_screen(
+            NewTicketModal(
+                f" new ticket · {team['key']}",
+                states=states,
+                members=members,
+                projects=projects,
+                cycles=cycles,
+            ),
+            done,
+        )
 
     def action_pick_project(self) -> None:
         projects: dict[str, dict] = {}

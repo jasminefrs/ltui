@@ -328,9 +328,12 @@ workspace.
 
 ## creating tickets
 
-`n` opens a minimal composer: title, optional markdown description, `ctrl+s`.
-The ticket lands in your list already highlighted, ready for `s` / `p` to
-slot it into the right column.
+`n` opens the ticket composer. Title is the only required field; description,
+status, priority, assignee, project, and cycle are all optional. In **All
+workspaces**, choose the destination workspace first and the available fields
+are loaded from that workspace's team. Press `ctrl+s` from anywhere in the
+composer to create the issue. The ticket lands in your list already
+highlighted.
 
 <div align="center">
 <img src="assets/new-ticket.png" alt="new ticket modal" width="80%">
